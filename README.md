@@ -39,6 +39,27 @@ export default tseslint.config([
 ])
 ```
 
+## WebRTC-assisted HLS streaming
+
+This app includes a minimal WebRTC + signaling integration to request HLS media segments over WebRTC DataChannels when available, and falls back to normal HTTP fetch otherwise. The logic is adapted from `client-simulator`.
+
+- Browser signaling client: `src/streaming/SignalingClient.ts`
+- WebRTC manager (DataChannel protocol): `src/streaming/WebRtcConnectionManager.ts`
+- Binary chunk protocol: `src/streaming/chunkProtocol.ts`
+- Hls.js custom loader: `src/streaming/HlsWebRtcLoader.ts`
+- Simple UI wired in `src/Home.tsx` using Hls.js with a custom loader wrapper
+
+Configure signaling server URL via environment:
+
+```bash
+# .env.local
+VITE_SIGNALING_WS_URL=ws://localhost:8083/ws/signaling
+```
+
+Notes:
+- The player will attempt to fetch fragments from peers first (via WebRTC) for ~250ms. If none are received, it uses normal HTTP.
+- When a segment is received it is cached in-memory and will be served to other peers on request.
+- Stream ID is used only for signaling identity; HLS fetching continues to use the provided HLS URL.
 You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
 
 ```js
