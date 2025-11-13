@@ -96,3 +96,13 @@ media-player {
 ::-webkit-scrollbar-thumb:hover {
     background: #555;
 }
+
+/* Spinner animation for Tailwind */
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+    animation: spin 1s linear infinite;
+}
+

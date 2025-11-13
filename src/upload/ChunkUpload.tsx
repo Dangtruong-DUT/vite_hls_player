@@ -1,20 +1,22 @@
 import { useState, useRef } from 'react';
-import { ChunkUploadService, type MovieMetadata } from './ChunkUploadService';
+import { ChunkUploadService, type MovieMetadata, type MovieInfo } from './ChunkUploadService';
 
 interface UploadState {
-    status: 'idle' | 'uploading' | 'completed' | 'error';
+    status: 'idle' | 'uploading' | 'completed' | 'monitoring' | 'ready' | 'error';
     progress: number;
     uploadedChunks: number;
     totalChunks: number;
     uploadId: string | null;
     movieId: string | null;
+    movieStatus: string | null;
+    movieInfo: MovieInfo | null;
+    monitoringAttempt: number;
     error: string | null;
 }
 
 function ChunkUpload() {
     const [file, setFile] = useState<File | null>(null);
-    const [title, setTitle] = useState('');
-    const [description, setDescription] = useState('');
+    const [movieId, setMovieId] = useState('');
     const [uploadState, setUploadState] = useState<UploadState>({
         status: 'idle',
         progress: 0,
@@ -22,6 +24,9 @@ function ChunkUpload() {
         totalChunks: 0,
         uploadId: null,
         movieId: null,
+        movieStatus: null,
+        movieInfo: null,
+        monitoringAttempt: 0,
         error: null
     });
     
@@ -67,17 +72,16 @@ function ChunkUpload() {
     };
 
     const handleUpload = async () => {
-        if (!file || !title.trim()) {
+        if (!file || !movieId.trim()) {
             setUploadState(prev => ({ 
                 ...prev, 
-                error: 'Vui lòng chọn file và nhập tiêu đề' 
+                error: 'Vui lòng chọn file và nhập Movie ID' 
             }));
             return;
         }
 
         const metadata: MovieMetadata = {
-            title: title.trim(),
-            description: description.trim() || 'No description provided'
+            movieId: movieId.trim()
         };
 
         const uploader = new ChunkUploadService({
@@ -103,6 +107,9 @@ function ChunkUpload() {
                 totalChunks: 0,
                 uploadId: null,
                 movieId: null,
+                movieStatus: null,
+                movieInfo: null,
+                monitoringAttempt: 0,
                 error: null
             });
 
@@ -133,10 +140,37 @@ function ChunkUpload() {
 
             setUploadState(prev => ({
                 ...prev,
-                status: 'completed',
+                status: 'monitoring',
                 movieId: result.movieId,
-                progress: 100
+                progress: 100,
+                movieStatus: result.status
             }));
+
+            // Start monitoring movie processing status
+            const movieInfo = await uploader.monitorMovieStatus(result.movieId, {
+                maxAttempts: 30,
+                intervalSeconds: 10,
+                onStatusChange: (movieStatus, attempt) => {
+                    setUploadState(prev => ({
+                        ...prev,
+                        movieStatus,
+                        monitoringAttempt: attempt
+                    }));
+                }
+            });
+
+            if (movieInfo && movieInfo.status === 'READY') {
+                setUploadState(prev => ({
+                    ...prev,
+                    status: 'ready',
+                    movieInfo
+                }));
+            } else {
+                setUploadState(prev => ({
+                    ...prev,
+                    status: 'completed'
+                }));
+            }
 
         } catch (error) {
             console.error('Upload failed:', error);
@@ -164,11 +198,13 @@ function ChunkUpload() {
             totalChunks: 0,
             uploadId: null,
             movieId: null,
+            movieStatus: null,
+            movieInfo: null,
+            monitoringAttempt: 0,
             error: null
         });
         setFile(null);
-        setTitle('');
-        setDescription('');
+        setMovieId('');
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
         }
@@ -182,11 +218,13 @@ function ChunkUpload() {
             totalChunks: 0,
             uploadId: null,
             movieId: null,
+            movieStatus: null,
+            movieInfo: null,
+            monitoringAttempt: 0,
             error: null
         });
         setFile(null);
-        setTitle('');
-        setDescription('');
+        setMovieId('');
         if (fileInputRef.current) {
             fileInputRef.current.value = '';
         }
@@ -285,40 +323,29 @@ function ChunkUpload() {
                                 </div>
                             </div>
 
-                            {/* Title Input */}
+                            {/* Movie ID Input */}
                             <div>
                                 <label className="block text-sm font-semibold text-gray-700 mb-2">
-                                    Tiêu đề <span className="text-red-500">*</span>
+                                    Movie ID <span className="text-red-500">*</span>
                                 </label>
                                 <input
                                     type="text"
-                                    value={title}
-                                    onChange={(e) => setTitle(e.target.value)}
-                                    placeholder="Nhập tiêu đề phim..."
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition-all outline-none"
+                                    value={movieId}
+                                    onChange={(e) => setMovieId(e.target.value)}
+                                    placeholder="Nhập Movie ID (UUID)..."
+                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition-all outline-none text-gray-900 placeholder-gray-400 font-mono"
                                 />
-                            </div>
-
-                            {/* Description Textarea */}
-                            <div>
-                                <label className="block text-sm font-semibold text-gray-700 mb-2">
-                                    Mô tả
-                                </label>
-                                <textarea
-                                    value={description}
-                                    onChange={(e) => setDescription(e.target.value)}
-                                    placeholder="Mô tả ngắn về phim (tùy chọn)..."
-                                    rows={4}
-                                    className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent transition-all outline-none resize-none"
-                                />
+                                <p className="text-xs text-gray-500 mt-1">
+                                    Ví dụ: e0bb3611-a059-4aca-961c-5fce4733e487
+                                </p>
                             </div>
 
                             {/* Upload Button */}
                             <button
                                 onClick={handleUpload}
-                                disabled={!file || !title.trim()}
+                                disabled={!file || !movieId.trim()}
                                 className={`w-full py-4 rounded-lg font-bold text-lg transition-all duration-200 flex items-center justify-center gap-3 ${
-                                    (!file || !title.trim())
+                                    (!file || !movieId.trim())
                                         ? 'bg-gray-300 text-gray-500 cursor-not-allowed'
                                         : 'bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5'
                                 }`}
@@ -398,6 +425,137 @@ function ChunkUpload() {
                         </div>
                     )}
 
+                    {uploadState.status === 'monitoring' && (
+                        <div className="space-y-6">
+                            {/* Monitoring Info */}
+                            <div className="bg-purple-50 border border-purple-200 rounded-xl p-6 space-y-3">
+                                <div className="flex items-center gap-3">
+                                    <div className="animate-pulse rounded-full h-8 w-8 bg-purple-600 flex items-center justify-center">
+                                        <svg className="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" />
+                                        </svg>
+                                    </div>
+                                    <h3 className="text-xl font-bold text-purple-900">Đang xử lý video...</h3>
+                                </div>
+                                
+                                <div className="grid grid-cols-2 gap-4 text-sm">
+                                    <div>
+                                        <p className="text-gray-600 font-medium">Movie ID</p>
+                                        <p className="text-gray-900 font-mono text-xs mt-1 break-all">{uploadState.movieId}</p>
+                                    </div>
+                                    <div>
+                                        <p className="text-gray-600 font-medium">Trạng thái</p>
+                                        <p className="text-gray-900 font-semibold mt-1">
+                                            {uploadState.movieStatus || 'PENDING'}
+                                        </p>
+                                    </div>
+                                    <div className="col-span-2">
+                                        <p className="text-gray-600 font-medium">Lần kiểm tra</p>
+                                        <p className="text-gray-900 font-semibold mt-1">
+                                            {uploadState.monitoringAttempt} / 30
+                                        </p>
+                                    </div>
+                                </div>
+                                
+                                <div className="bg-purple-100 rounded-lg p-4 mt-4">
+                                    <p className="text-sm text-purple-800">
+                                        ⏳ Server đang chuyển đổi video sang các chất lượng khác nhau. 
+                                        Quá trình này có thể mất vài phút tùy thuộc vào kích thước file.
+                                    </p>
+                                </div>
+                            </div>
+
+                            {/* Progress indicator */}
+                            <div className="flex justify-center">
+                                <div className="flex space-x-2">
+                                    <div className="w-3 h-3 bg-purple-600 rounded-full animate-bounce"></div>
+                                    <div className="w-3 h-3 bg-purple-600 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                                    <div className="w-3 h-3 bg-purple-600 rounded-full animate-bounce" style={{ animationDelay: '0.4s' }}></div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {uploadState.status === 'ready' && uploadState.movieInfo && (
+                        <div className="space-y-6">
+                            {/* Success Card */}
+                            <div className="bg-gradient-to-br from-green-50 to-emerald-50 border-2 border-green-300 rounded-xl p-8 text-center">
+                                <div className="flex justify-center mb-4">
+                                    <div className="w-20 h-20 bg-green-500 rounded-full flex items-center justify-center">
+                                        <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                                        </svg>
+                                    </div>
+                                </div>
+                                
+                                <h3 className="text-2xl font-bold text-green-800 mb-2">Video đã sẵn sàng!</h3>
+                                <p className="text-green-600 mb-6">Video đã được xử lý và sẵn sàng để streaming</p>
+                                
+                                <div className="bg-white rounded-lg p-6 space-y-4 text-left shadow-md">
+                                    <div className="flex items-start gap-3">
+                                        <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                        </svg>
+                                        <div className="flex-1">
+                                            <p className="text-sm font-semibold text-gray-600">Movie ID</p>
+                                            <p className="text-base font-mono font-bold text-gray-900 break-all">{uploadState.movieInfo.movieId}</p>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex items-start gap-3">
+                                        <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                        </svg>
+                                        <div className="flex-1">
+                                            <p className="text-sm font-semibold text-gray-600">Tiêu đề</p>
+                                            <p className="text-base font-bold text-gray-900">{uploadState.movieInfo.title}</p>
+                                        </div>
+                                    </div>
+                                    
+                                    <div className="flex items-start gap-3">
+                                        <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                                            <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                        </svg>
+                                        <div className="flex-1">
+                                            <p className="text-sm font-semibold text-gray-600">Trạng thái</p>
+                                            <p className="text-base font-bold text-green-600">{uploadState.movieInfo.status}</p>
+                                        </div>
+                                    </div>
+                                    
+                                    {uploadState.movieInfo.qualities && Object.keys(uploadState.movieInfo.qualities).length > 0 && (
+                                        <div className="flex items-start gap-3">
+                                            <svg className="w-5 h-5 text-green-500 mt-0.5 flex-shrink-0" fill="currentColor" viewBox="0 0 20 20">
+                                                <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clipRule="evenodd" />
+                                            </svg>
+                                            <div className="flex-1">
+                                                <p className="text-sm font-semibold text-gray-600 mb-2">Chất lượng có sẵn</p>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {Object.keys(uploadState.movieInfo.qualities).map((quality) => (
+                                                        <span key={quality} className="px-3 py-1 bg-green-100 text-green-800 rounded-full text-xs font-semibold">
+                                                            {quality}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* New Upload Button */}
+                            <button
+                                onClick={handleReset}
+                                className="w-full py-4 bg-gradient-to-r from-blue-500 to-blue-600 hover:from-blue-600 hover:to-blue-700 text-white font-bold rounded-lg transition-all duration-200 flex items-center justify-center gap-3 shadow-lg hover:shadow-xl transform hover:-translate-y-0.5"
+                            >
+                                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+                                </svg>
+                                Upload phim khác
+                            </button>
+                        </div>
+                    )}
+
                     {uploadState.status === 'completed' && (
                         <div className="space-y-6">
                             {/* Success Card */}
@@ -411,7 +569,7 @@ function ChunkUpload() {
                                 </div>
                                 
                                 <h3 className="text-2xl font-bold text-green-800 mb-2">Upload thành công!</h3>
-                                <p className="text-green-600 mb-6">Video của bạn đã được tải lên và sẵn sàng để streaming</p>
+                                <p className="text-green-600 mb-6">Video đã được tải lên nhưng vẫn đang được xử lý</p>
                                 
                                 <div className="bg-white rounded-lg p-6 space-y-4 text-left shadow-md">
                                     <div className="flex items-start gap-3">

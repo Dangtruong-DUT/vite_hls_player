@@ -2,8 +2,7 @@ import axios, { type AxiosInstance } from 'axios';
 import CryptoJS from 'crypto-js';
 
 export interface MovieMetadata {
-    title: string;
-    description: string;
+    movieId: string;
 }
 
 export interface ChunkUploadOptions {
@@ -18,6 +17,20 @@ export interface UploadStatus {
     uploadedChunks: number;
     progressPercentage: number;
     missingChunks: number[];
+}
+
+export interface MovieStatus {
+    movieId: string;
+    status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
+    qualities?: Record<string, string>;
+}
+
+export interface MovieInfo {
+    movieId: string;
+    title: string;
+    description: string;
+    status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
+    qualities?: Record<string, string>;
 }
 
 export class ChunkUploadService {
@@ -59,8 +72,7 @@ export class ChunkUploadService {
             mimeType,
             totalSize: this.fileSize,
             chunkSize: this.CHUNK_SIZE,
-            movieTitle: metadata.title,
-            movieDescription: metadata.description
+            movieId: metadata.movieId
         };
 
         console.log(`Starting chunk upload session for ${file.name}`);
@@ -119,6 +131,77 @@ export class ChunkUploadService {
         return response.data.data;
     }
 
+    async checkMovieStatus(movieId: string): Promise<MovieStatus> {
+        const response = await this.api.get(`/api/movies/${movieId}/status`);
+        return response.data.data;
+    }
+
+    async getMovieInfo(movieId: string): Promise<MovieInfo> {
+        const response = await this.api.get(`/api/movies/${movieId}`);
+        return response.data.data;
+    }
+
+    async monitorMovieStatus(
+        movieId: string,
+        options: {
+            maxAttempts?: number;
+            intervalSeconds?: number;
+            onStatusChange?: (status: string, attempt: number) => void;
+        } = {}
+    ): Promise<MovieInfo | null> {
+        const maxAttempts = options.maxAttempts || 30;
+        const intervalSeconds = options.intervalSeconds || 10;
+
+        console.log(`Starting movie status monitoring for ${movieId}`);
+        console.log(`Will check every ${intervalSeconds} seconds for up to ${maxAttempts} attempts`);
+
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                const statusData = await this.checkMovieStatus(movieId);
+                const status = statusData.status;
+
+                console.log(`[${attempt}/${maxAttempts}] Current status: ${status}`);
+                
+                if (options.onStatusChange) {
+                    options.onStatusChange(status, attempt);
+                }
+
+                if (status === 'READY') {
+                    console.log('🎉 Movie is ready!');
+                    const movieInfo = await this.getMovieInfo(movieId);
+                    
+                    if (movieInfo.qualities) {
+                        console.log('Available qualities:', Object.keys(movieInfo.qualities));
+                    }
+                    
+                    return movieInfo;
+                } else if (status === 'FAILED') {
+                    console.error('❌ Movie processing failed');
+                    throw new Error('Movie processing failed');
+                }
+
+                if (attempt < maxAttempts) {
+                    console.log(`Waiting ${intervalSeconds} seconds before next check...`);
+                    await this.delay(intervalSeconds * 1000);
+                }
+
+            } catch (error) {
+                console.error(`Status check attempt ${attempt} failed:`, error);
+
+                if (attempt < maxAttempts) {
+                    console.log('Retrying in 5 seconds...');
+                    await this.delay(5000);
+                } else {
+                    throw error;
+                }
+            }
+        }
+
+        console.warn('⏰ Monitoring timeout reached');
+        console.log('Movie may still be processing. Check manually later.');
+        return null;
+    }
+
     async cancel(): Promise<void> {
         if (!this.uploadId) {
             return;
@@ -143,22 +226,26 @@ export class ChunkUploadService {
         const checksum = CryptoJS.MD5(wordArray).toString();
 
         const formData = new FormData();
+        
+        // Append binary chunk data
         formData.append('chunk', chunkBlob, `chunk_${chunkNumber}`);
-        formData.append('data', JSON.stringify({
+        
+        // Append metadata as JSON with explicit content type
+        const metadata = {
             uploadId: this.uploadId,
             chunkNumber,
             chunkSize,
             checksum
-        }));
+        };
+        const metadataBlob = new Blob([JSON.stringify(metadata)], { 
+            type: 'application/json' 
+        });
+        formData.append('data', metadataBlob);
 
         await this.api.post(
             `/api/movies/chunk-upload/${this.uploadId}/chunks/${chunkNumber}`,
-            formData,
-            {
-                headers: {
-                    'Content-Type': 'multipart/form-data'
-                }
-            }
+            formData
+            // Note: Don't set Content-Type header manually, let browser handle multipart boundaries
         );
 
         this.uploadedChunks.add(chunkNumber);

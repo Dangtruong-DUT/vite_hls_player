@@ -9,6 +9,6 @@ export default defineConfig({
         devSourcemap: true,
     },
     server: {
-        port: 3434,
+        port: 3000,
     },
 });
