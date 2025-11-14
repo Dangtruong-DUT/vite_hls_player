@@ -85,7 +85,7 @@ export class SegmentFetcher {
     try {
       const response = await this.fetchWithTimeout(url, config.fetchTimeout);
       const text = await response.text();
-      const playlist = this.parseVariantPlaylist(text, qualityId, url);
+      const playlist = this.parseVariantPlaylist(text, qualityId);
 
       // Cache it (TTL configured in CacheManager constructor)
       this.cacheManager.setVariantPlaylist(this.movieId, qualityId, playlist);
@@ -232,8 +232,8 @@ export class SegmentFetcher {
   async fetchSegments(
     segments: SegmentMetadata[],
     options: FetchOptions = {}
-  ): Promise<Map<number, FetchResult>> {
-    const results = new Map<number, FetchResult>();
+  ): Promise<Map<string, FetchResult>> {
+    const results = new Map<string, FetchResult>();
     const config = this.configManager.getConfig();
     const maxConcurrent = config.maxConcurrentFetches;
 
@@ -254,7 +254,7 @@ export class SegmentFetcher {
   /**
    * Cancel ongoing fetch
    */
-  cancelFetch(qualityId: string, segmentId: number): void {
+  cancelFetch(qualityId: string, segmentId: string): void {
     const fetchKey = `${qualityId}:${segmentId}`;
     const controller = this.activeFetches.get(fetchKey);
     if (controller) {
@@ -315,8 +315,7 @@ export class SegmentFetcher {
    */
   private parseVariantPlaylist(
     content: string,
-    qualityId: string,
-    baseUrl: string
+    qualityId: string
   ): VariantPlaylist {
     const lines = content.split('\n').map(l => l.trim());
     const segments: SegmentMetadata[] = [];
@@ -333,16 +332,24 @@ export class SegmentFetcher {
         const urlLine = lines[i + 1];
 
         if (urlLine && !urlLine.startsWith('#')) {
-          // Extract segment ID from URL (e.g., 123 from segments/123)
-          const match = urlLine.match(/segments\/(\d+)/);
-          const segmentId = match ? parseInt(match[1], 10) : segments.length;
-
+          // Extract segment ID from filename (e.g., "seg_0001.m4s" or "123.m4s")
+          let segmentId: string;
+          const newFormatMatch = urlLine.match(/(seg_\d+\.m4s)/);
+          const oldFormatMatch = urlLine.match(/(\d+)\.m4s/);
+          if (newFormatMatch) {
+            segmentId = newFormatMatch[1];
+          } else if (oldFormatMatch) {
+            const numId = parseInt(oldFormatMatch[1], 10);
+            segmentId = `seg_${String(numId).padStart(4, '0')}.m4s`;
+          } else {
+            segmentId = `seg_${String(segments.length).padStart(4, '0')}.m4s`;
+          }
           segments.push({
             id: segmentId,
+            movieId: this.movieId,
             qualityId,
             duration,
-            timestamp: currentTime,
-            url: urlLine.startsWith('http') ? urlLine : baseUrl + '/' + urlLine,
+            timestamp: currentTime
           });
 
           currentTime += duration;

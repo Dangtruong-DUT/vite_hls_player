@@ -25,7 +25,7 @@ export interface SeederEndpoints {
   masterPlaylist: (movieId: string) => string;
   variantPlaylist: (movieId: string, qualityId: string) => string;
   initSegment: (movieId: string, qualityId: string) => string;
-  mediaSegment: (movieId: string, qualityId: string, segmentId: number) => string;
+  mediaSegment: (movieId: string, qualityId: string, segmentId: string) => string;
 }
 
 export interface CacheConfig {
@@ -64,10 +64,10 @@ export class CacheManager {
 
   // Seeder endpoints
   private seederEndpoints: SeederEndpoints = {
-    masterPlaylist: (movieId) => `/api/seeder/playlists/${movieId}/master.m3u8`,
-    variantPlaylist: (movieId, qualityId) => `/api/seeder/playlists/${movieId}/${qualityId}/playlist.m3u8`,
-    initSegment: (movieId, qualityId) => `/api/seeder/segments/${movieId}/${qualityId}/init.mp4`,
-    mediaSegment: (movieId, qualityId, segmentId) => `/api/seeder/segments/${movieId}/${qualityId}/${segmentId}.m4s`,
+    masterPlaylist: (movieId) => `/api/streams/movies/${movieId}/master.m3u8`,
+    variantPlaylist: (movieId, qualityId) => `/api/streams/movies/${movieId}/${qualityId}/playlist.m3u8`,
+    initSegment: (movieId, qualityId) => `/api/streams/movies/${movieId}/${qualityId}/init.mp4`,
+    mediaSegment: (movieId, qualityId, segmentId) => `/api/streams/movies/${movieId}/${qualityId}/segments/${segmentId}`,
   };
 
   constructor(config?: Partial<CacheConfig>) {
@@ -221,7 +221,7 @@ export class CacheManager {
   setSegment(
     movieId: string,
     qualityId: string,
-    segmentId: number,
+    segmentId: string,
     data: ArrayBuffer
   ): void {
     const key = this.getSegmentKey(movieId, qualityId, segmentId);
@@ -231,7 +231,7 @@ export class CacheManager {
   /**
    * Get media segment
    */
-  getSegment(movieId: string, qualityId: string, segmentId: number): ArrayBuffer | null {
+  getSegment(movieId: string, qualityId: string, segmentId: string): ArrayBuffer | null {
     const key = this.getSegmentKey(movieId, qualityId, segmentId);
     return this.get<ArrayBuffer>(key);
   }
@@ -239,26 +239,26 @@ export class CacheManager {
   /**
    * Check if segment exists
    */
-  hasSegment(movieId: string, qualityId: string, segmentId: number): boolean {
+  hasSegment(movieId: string, qualityId: string, segmentId: string): boolean {
     const key = this.getSegmentKey(movieId, qualityId, segmentId);
     return this.has(key);
   }
 
   /**
    * Get segments in range (for seek optimization)
+   * Note: With string IDs, caller should provide array of segmentIds
    */
   getSegmentsInRange(
     movieId: string,
     qualityId: string,
-    startSegmentId: number,
-    endSegmentId: number
-  ): Map<number, ArrayBuffer> {
-    const segments = new Map<number, ArrayBuffer>();
+    segmentIds: string[]
+  ): Map<string, ArrayBuffer> {
+    const segments = new Map<string, ArrayBuffer>();
 
-    for (let i = startSegmentId; i <= endSegmentId; i++) {
-      const data = this.getSegment(movieId, qualityId, i);
+    for (const segmentId of segmentIds) {
+      const data = this.getSegment(movieId, qualityId, segmentId);
       if (data) {
-        segments.set(i, data);
+        segments.set(segmentId, data);
       }
     }
 
@@ -346,7 +346,7 @@ export class CacheManager {
   /**
    * Map time → segmentId
    */
-  mapTimeToSegmentId(movieId: string, qualityId: string, time: number): number | null {
+  mapTimeToSegmentId(movieId: string, qualityId: string, time: number): string | null {
     const mapKey = `${movieId}:${qualityId}`;
     const segments = this.segmentTimeMaps.get(mapKey);
 
@@ -447,7 +447,7 @@ export class CacheManager {
   /**
    * Get Seeder endpoint cho media segment
    */
-  getMediaSegmentEndpoint(movieId: string, qualityId: string, segmentId: number): string {
+  getMediaSegmentEndpoint(movieId: string, qualityId: string, segmentId: string): string {
     return this.seederEndpoints.mediaSegment(movieId, qualityId, segmentId);
   }
 
@@ -473,7 +473,7 @@ export class CacheManager {
   async fetchAndCacheSegment(
     movieId: string,
     qualityId: string,
-    segmentId: number
+    segmentId: string
   ): Promise<ArrayBuffer> {
     // Check cache first
     const cached = this.getSegment(movieId, qualityId, segmentId);
@@ -626,7 +626,7 @@ export class CacheManager {
 
   // ============ Key Generation ============
 
-  private getSegmentKey(movieId: string, qualityId: string, segmentId: number): string {
+  private getSegmentKey(movieId: string, qualityId: string, segmentId: string): string {
     return `segment:${movieId}:${qualityId}:${segmentId}`;
   }
 

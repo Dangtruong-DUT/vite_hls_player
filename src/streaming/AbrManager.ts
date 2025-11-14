@@ -28,7 +28,7 @@ export interface AbrManagerEvents {
   qualityChanged: (oldQuality: Quality | null, newQuality: Quality, reason: string) => void;
   initSegmentFetched: (qualityId: string, size: number) => void;
   bandwidthEstimated: (bandwidth: number) => void;
-  segmentFetched: (segmentId: number, qualityId: string, source: string) => void;
+  segmentFetched: (segmentId: string, qualityId: string, source: string) => void;
   prefetchComplete: (count: number, qualityId: string) => void;
 }
 
@@ -54,7 +54,6 @@ export class AbrManager {
   private prefetchedSegments = new Set<string>(); // Set of "qualityId:segmentId"
   
   private eventListeners: Partial<AbrManagerEvents> = {};
-  private seederEndpoint: string;
 
   constructor(
     movieId: string,
@@ -62,14 +61,12 @@ export class AbrManager {
     signalingClient: SignalingClient,
     cacheManager: CacheManager,
     configManager: ConfigManager,
-    seederEndpoint = configManager.getConfig().baseUrl + '/streams/movies'
   ) {
     this.movieId = movieId;
     this.peerManager = peerManager;
     this.signalingClient = signalingClient;
     this.cacheManager = cacheManager;
     this.configManager = configManager;
-    this.seederEndpoint = seederEndpoint;
   }
 
   /**
@@ -102,7 +99,7 @@ export class AbrManager {
    */
   private async loadVariantPlaylist(qualityId: string): Promise<void> {
     try {
-      const url = `${this.seederEndpoint}/${this.movieId}/${qualityId}/playlist.m3u8`;
+      const url = this.configManager.getSeederUrl(this.movieId, qualityId, 'playlist.m3u8');
       const response = await fetch(url);
       
       if (!response.ok) {
@@ -144,16 +141,28 @@ export class AbrManager {
         const nextLine = lines[i + 1];
         
         if (nextLine && !nextLine.startsWith('#')) {
-          // Extract segment ID from filename (e.g., "42.m4s" -> 42)
-          const match = nextLine.match(/(\d+)\.m4s/);
-          const segmentId = match ? parseInt(match[1]) : segments.length;
+          // Extract segment ID from filename (e.g., "seg_0042.m4s" or "42.m4s")
+          let segmentId: string;
+          const newFormatMatch = nextLine.match(/(seg_\d+\.m4s)/);
+          const oldFormatMatch = nextLine.match(/(\d+)\.m4s/);
+          
+          if (newFormatMatch) {
+            segmentId = newFormatMatch[1]; // "seg_0042.m4s"
+          } else if (oldFormatMatch) {
+            // Convert old format to new format
+            const numId = parseInt(oldFormatMatch[1], 10);
+            segmentId = `seg_${String(numId).padStart(4, '0')}.m4s`;
+          } else {
+            // Fallback: use index
+            segmentId = `seg_${String(segments.length).padStart(4, '0')}.m4s`;
+          }
 
           segments.push({
             id: segmentId,
+            movieId: this.movieId,
             qualityId,
             duration,
-            timestamp: currentTimestamp,
-            url: `${this.seederEndpoint}/${this.movieId}/${qualityId}/${nextLine}`,
+            timestamp: currentTimestamp
           });
 
           currentTimestamp += duration;
@@ -223,7 +232,7 @@ export class AbrManager {
 
     // Fetch from seeder endpoint
     console.log(`[AbrManager] Fetching init segment for ${qualityId}`);
-    const url = this.getInitSegmentUrl(qualityId);
+    const url = this.configManager.getSeederUrl(this.movieId, qualityId, 'init.mp4');
 
     try {
       const response = await fetch(url);
@@ -255,21 +264,14 @@ export class AbrManager {
   }
 
   /**
-   * Get init segment URL for a quality
-   */
-  private getInitSegmentUrl(qualityId: string): string {
-    return `${this.seederEndpoint}/${this.movieId}/${qualityId}/init.mp4`;
-  }
-
-  /**
    * Fetch segment with cache and P2P lookup by (movieId, qualityId, segmentId)
    * 
-   * @param segmentId - Segment ID to fetch
+   * @param segmentId - Segment ID (format: "seg_0001.m4s")
    * @param qualityId - Quality ID (optional, uses current quality if not specified)
    * @returns Segment data
    */
   async fetchSegment(
-    segmentId: number,
+    segmentId: string,
     qualityId?: string
   ): Promise<ArrayBuffer> {
     const targetQualityId = qualityId || this.currentQuality?.id;
@@ -315,13 +317,22 @@ export class AbrManager {
       this.cacheManager.set(cacheKey, result.data, config.cacheSegmentTTL);
 
       // Report to signaling for swarm coordination
-      this.signalingClient.reportSegmentFetch(
-        segmentId,
-        targetQualityId,
-        result.source,
-        result.peerId,
-        latency
-      );
+      // Convert segmentId (number) to filename format for signaling protocol
+      const segmentFilename = `segment-${segmentId}.ts`;
+      // Map internal FetchSource to protocol source type
+      const reportSource: 'peer' | 'server' | undefined = 
+        result.source === 'peer' ? 'peer' : 
+        (result.source === 'seeder' || result.source === 'origin') ? 'server' :
+        undefined; // cache doesn't need reporting
+      
+      if (reportSource) {
+        this.signalingClient.reportSegmentFetch(
+          segmentFilename,
+          targetQualityId,
+          reportSource,
+          latency
+        );
+      }
 
       this.emit('segmentFetched', segmentId, targetQualityId, result.source);
 
@@ -375,19 +386,23 @@ export class AbrManager {
 
     const segmentsToFetch: SegmentMetadata[] = [];
 
-    // Add segments behind
-    for (let i = Math.max(0, currentSegment.id - windowBehind); i < currentSegment.id; i++) {
-      const seg = playlist.segments.find(s => s.id === i);
-      if (seg) segmentsToFetch.push(seg);
+    // Find current segment index
+    const currentIndex = playlist.segments.findIndex(s => s.id === currentSegment.id);
+    if (currentIndex === -1) {
+      throw new Error(`Current segment not found in playlist`);
+    }
+
+    // Add segments behind (by index)
+    for (let i = Math.max(0, currentIndex - windowBehind); i < currentIndex; i++) {
+      segmentsToFetch.push(playlist.segments[i]);
     }
 
     // Add current segment
     segmentsToFetch.push(currentSegment);
 
-    // Add segments ahead
-    for (let i = currentSegment.id + 1; i <= Math.min(playlist.segments.length - 1, currentSegment.id + windowAhead); i++) {
-      const seg = playlist.segments.find(s => s.id === i);
-      if (seg) segmentsToFetch.push(seg);
+    // Add segments ahead (by index)
+    for (let i = currentIndex + 1; i <= Math.min(playlist.segments.length - 1, currentIndex + windowAhead); i++) {
+      segmentsToFetch.push(playlist.segments[i]);
     }
 
     console.log(`[AbrManager] Fetching ${segmentsToFetch.length} segments around seek position`);
@@ -411,11 +426,11 @@ export class AbrManager {
    * Prefetch next segments in current quality
    * Called after quality switch or during normal playback
    * 
-   * @param currentSegmentId - Current playback segment ID
+   * @param currentSegmentId - Current playback segment ID (format: "seg_0001.m4s")
    * @param count - Number of segments to prefetch ahead
    */
   async prefetchNextSegments(
-    currentSegmentId: number,
+    currentSegmentId: string,
     count?: number
   ): Promise<void> {
     if (!this.currentQuality) {
@@ -434,12 +449,17 @@ export class AbrManager {
     const config = this.configManager.getConfig();
     const prefetchCount = count || Math.ceil(config.prefetchWindowAhead / playlist.targetDuration);
 
+    // Find current segment index
+    const currentIndex = playlist.segments.findIndex(s => s.id === currentSegmentId);
+    if (currentIndex === -1) {
+      console.warn(`[AbrManager] Current segment ${currentSegmentId} not found`);
+      return;
+    }
+
     const segmentsToPrefetch: SegmentMetadata[] = [];
 
-    for (let i = currentSegmentId + 1; i <= Math.min(playlist.segments.length - 1, currentSegmentId + prefetchCount); i++) {
-      const seg = playlist.segments.find(s => s.id === i);
-      if (!seg) continue;
-
+    for (let i = currentIndex + 1; i <= Math.min(playlist.segments.length - 1, currentIndex + prefetchCount); i++) {
+      const seg = playlist.segments[i];
       const segmentKey = `${qualityId}:${seg.id}`;
       
       // Skip if already prefetched or cached
@@ -598,14 +618,6 @@ export class AbrManager {
    */
   getMovieId(): string {
     return this.movieId;
-  }
-
-  /**
-   * Set seeder endpoint
-   */
-  setSeederEndpoint(endpoint: string): void {
-    this.seederEndpoint = endpoint;
-    console.log(`[AbrManager] Seeder endpoint updated: ${endpoint}`);
   }
 
   /**

@@ -66,13 +66,15 @@ export class MseManager {
     });
 
     this.videoElement.addEventListener('waiting', () => {
-      if (!this.videoElement.paused) {
+      // Không buffering nếu video đã kết thúc hoặc đang pause
+      if (!this.videoElement.paused && !this.videoElement.ended) {
         this.updatePlaybackState('buffering');
       }
     });
 
     this.videoElement.addEventListener('canplay', () => {
-      if (!this.videoElement.paused) {
+      // Không chuyển sang playing nếu video đã kết thúc
+      if (!this.videoElement.paused && !this.videoElement.ended) {
         this.updatePlaybackState('playing');
       }
     });

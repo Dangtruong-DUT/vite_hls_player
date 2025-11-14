@@ -30,8 +30,7 @@ export default function StreamingPlayerDemo({ clientId, movieId = '3a044ac7-70c6
     const player = new StreamingPlayerCoordinator({
       movieId: inputMovieId,
       clientId,
-      videoElement: videoRef.current,
-      signalingUrl: import.meta.env.VITE_SIGNALING_WS_URL || 'ws://localhost:8083/ws/signaling', // Use env var or default
+      videoElement: videoRef.current
     });
 
     playerRef.current = player;

@@ -9,16 +9,16 @@ export const DEFAULT_CONFIG: StreamingConfig = {
   // Peer settings
   maxActivePeers: 6,
   minActivePeers: 2,
-  peerConnectionTimeout: 10000, // 10s - timeout for establishing peer connection
+  peerConnectionTimeout: 5000, // 5s - reduced from 10s for faster fallback
   peerScoreThreshold: 0.3, // Minimum score to keep connection
 
   // Buffer settings
-  prefetchWindowAhead: 30, // 30 seconds ahead of playback position
-  prefetchWindowBehind: 10, // 10 seconds behind during seek
-  bufferTargetDuration: 20, // Target 20s of buffer
-  bufferMinThreshold: 5, // Critical buffer threshold - start buffering if below 5s
-  bufferMaxThreshold: 60, // Stop prefetching if above 60s
-  minBufferPrefetch: 3, // Minimum 3s buffer before starting prefetch
+  prefetchWindowAhead: 60, // 60 seconds ahead of playback position (expanded from 30s)
+  prefetchWindowBehind: 20, // 20 seconds behind during seek (expanded from 10s)
+  bufferTargetDuration: 30, // Target 30s of buffer (expanded from 20s)
+  bufferMinThreshold: 8, // Critical buffer threshold - start buffering if below 8s (expanded from 5s)
+  bufferMaxThreshold: 120, // Stop prefetching if above 120s (expanded from 60s)
+  minBufferPrefetch: 5, // Minimum 5s buffer before starting prefetch (expanded from 3s)
 
   // ABR settings
   abrEnabled: true,
@@ -27,28 +27,28 @@ export const DEFAULT_CONFIG: StreamingConfig = {
   bandwidthEstimationWindow: 5, // Use last 5 segments for bandwidth estimation
 
   // Cache settings
-  cacheSizeLimit: 500 * 1024 * 1024, // 500MB
-  cacheSegmentTTL: 5 * 60 * 1000, // 5 minutes
-  cachePlaylistTTL: 60 * 1000, // 1 minute
-  cacheInitSegmentTTL: 30 * 60 * 1000, // 30 minutes
+  cacheSizeLimit: 1024 * 1024 * 1024, // 1GB (expanded from 500MB)
+  cacheSegmentTTL: 15 * 60 * 1000, // 15 minutes (expanded from 5 minutes)
+  cachePlaylistTTL: 5 * 60 * 1000, // 5 minutes (expanded from 1 minute)
+  cacheInitSegmentTTL: 60 * 60 * 1000, // 60 minutes (expanded from 30 minutes)
 
   // Fetch settings
-  maxConcurrentFetches: 4,
-  fetchTimeout: 8000, // 8s - fallback HTTP timeout
-  maxRetries: 3,
-  retryDelayBase: 500, // 500ms, will be exponentially backed off
+  maxConcurrentFetches: 6, // 6 concurrent fetches (expanded from 4)
+  fetchTimeout: 5000, // 5s - reduced from 8s for faster fallback
+  maxRetries: 2, // Reduced from 3 to 2 for faster fallback
+  retryDelayBase: 300, // 300ms, reduced from 500ms
   staggeredRequestDelay: 100, // 100ms between peer requests
   segmentRequestWaitMin: 50, // Minimum 50ms wait before sending segment request
   segmentRequestWaitMax: 200, // Maximum 200ms wait before sending segment request
 
   // Signaling settings
   signalingReconnectInterval: 5000, // 5s
-  signalingHeartbeatInterval: 30000, // 30s
-  whoHasTimeout: 3000, // 3s - timeout for WhoHas query
+  signalingHeartbeatInterval: 0, // 0 = disabled (let WebSocket handle keep-alive)
+  whoHasTimeout: 2000, // 2s - reduced from 3s for faster fallback
 
   // Seek optimization settings
-  seekPrefetchAhead: 5, // Prefetch 5 segments ahead on seek
-  seekPrefetchBehind: 2, // Prefetch 2 segments behind on seek
+  seekPrefetchAhead: 10, // Prefetch 10 segments ahead on seek (expanded from 5)
+  seekPrefetchBehind: 5, // Prefetch 5 segments behind on seek (expanded from 2)
 
   // API endpoints
   baseUrl: import.meta.env.VITE_BASE_URL || 'http://localhost:8080/api',
@@ -372,8 +372,8 @@ export class ConfigManager {
         return `${base}/movies/${movieId}/${qualityId}/init.mp4`;
       
       default:
-        // Assume resource is a segment ID
-        return `${base}/movies/${movieId}/${qualityId}/${resource}.m4s`;
+        // Assume resource is a segment ID with extension (e.g., "seg_0001.m4s")
+        return `${base}/movies/${movieId}/${qualityId}/segments/${resource}`;
     }
   }
 

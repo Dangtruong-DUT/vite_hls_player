@@ -42,18 +42,19 @@ export class PeerManager {
     { urls: 'stun:stun1.l.google.com:19302' },
   ];
   private eventListeners: Partial<PeerManagerEvents> = {};
-  private fallbackEndpoint: string;
   private requestIdCounter = 0;
   private lastStaggerDelay = 0;
+  // Track recent signaling messages to prevent duplicates
+  private recentOffers = new Map<string, number>(); // peerId -> timestamp
+  private recentAnswers = new Map<string, number>(); // peerId -> timestamp
+  private readonly SIGNALING_DEBOUNCE_MS = 500; // Ignore duplicates within 500ms
 
   constructor(
     signalingClient: SignalingClient, 
-    configManager: ConfigManager,
-    fallbackEndpoint = '/api/streams'
+    configManager: ConfigManager
   ) {
     this.signalingClient = signalingClient;
     this.configManager = configManager;
-    this.fallbackEndpoint = fallbackEndpoint;
     this.setupSignalingListeners();
   }
 
@@ -61,16 +62,24 @@ export class PeerManager {
    * Setup signaling client listeners
    */
   private setupSignalingListeners(): void {
-    this.signalingClient.on('peerOffer', async ({ peerId, offer }) => {
-      await this.handlePeerOffer(peerId, offer);
+    this.signalingClient.on('rtcOffer', async (message) => {
+      const offer: RTCSessionDescriptionInit = {
+        type: 'offer',
+        sdp: message.sdp,
+      };
+      await this.handlePeerOffer(message.from, offer);
     });
 
-    this.signalingClient.on('peerAnswer', async ({ peerId, answer }) => {
-      await this.handlePeerAnswer(peerId, answer);
+    this.signalingClient.on('rtcAnswer', async (message) => {
+      const answer: RTCSessionDescriptionInit = {
+        type: 'answer',
+        sdp: message.sdp,
+      };
+      await this.handlePeerAnswer(message.from, answer);
     });
 
-    this.signalingClient.on('iceCandidate', async ({ peerId, candidate }) => {
-      await this.handleIceCandidate(peerId, candidate);
+    this.signalingClient.on('iceCandidate', async (message) => {
+      await this.handleIceCandidate(message.from, message.candidate);
     });
   }
 
@@ -143,6 +152,37 @@ export class PeerManager {
    */
   private async handlePeerOffer(peerId: string, offer: RTCSessionDescriptionInit): Promise<void> {
     try {
+      // Check for duplicate offer (debounce)
+      const lastOfferTime = this.recentOffers.get(peerId);
+      const now = Date.now();
+      if (lastOfferTime && (now - lastOfferTime) < this.SIGNALING_DEBOUNCE_MS) {
+        console.log(`[PeerManager] Ignoring duplicate offer from ${peerId} (within ${this.SIGNALING_DEBOUNCE_MS}ms)`);
+        return;
+      }
+      this.recentOffers.set(peerId, now);
+
+      // Validate offer
+      if (!offer || !offer.type || !offer.sdp) {
+        console.error(`[PeerManager] Invalid offer from ${peerId}:`, {
+          hasOffer: !!offer,
+          type: offer?.type,
+          hasSdp: !!offer?.sdp,
+          sdpLength: offer?.sdp?.length || 0
+        });
+        return;
+      }
+
+      console.log(`[PeerManager] Received valid offer from ${peerId} (SDP length: ${offer.sdp.length})`);
+
+      // Check if peer already exists
+      const existingPeer = this.peers.get(peerId);
+      if (existingPeer) {
+        console.log(`[PeerManager] Peer ${peerId} already exists, cleaning up old connection`);
+        this.disconnectPeer(peerId);
+        // Wait a bit for cleanup to complete
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+
       // Check max peers limit before accepting
       const config = this.configManager.getConfig();
       const activePeers = this.getActivePeerCount();
@@ -177,7 +217,12 @@ export class PeerManager {
         this.setupDataChannelHandlers(peerInfo);
       };
 
-      await peerConnection.setRemoteDescription(offer);
+      // Check signaling state before setting remote description
+      if (peerConnection.signalingState !== 'stable') {
+        console.warn(`[PeerManager] Peer connection not in stable state: ${peerConnection.signalingState}`);
+      }
+
+      await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
 
@@ -193,6 +238,15 @@ export class PeerManager {
    * Handle peer answer
    */
   private async handlePeerAnswer(peerId: string, answer: RTCSessionDescriptionInit): Promise<void> {
+    // Check for duplicate answer (debounce)
+    const lastAnswerTime = this.recentAnswers.get(peerId);
+    const now = Date.now();
+    if (lastAnswerTime && (now - lastAnswerTime) < this.SIGNALING_DEBOUNCE_MS) {
+      console.log(`[PeerManager] Ignoring duplicate answer from ${peerId} (within ${this.SIGNALING_DEBOUNCE_MS}ms)`);
+      return;
+    }
+    this.recentAnswers.set(peerId, now);
+
     const peer = this.peers.get(peerId);
     if (!peer || !peer.peerConnection) {
       console.warn(`[PeerManager] Received answer for unknown peer ${peerId}`);
@@ -200,7 +254,31 @@ export class PeerManager {
     }
 
     try {
-      await peer.peerConnection.setRemoteDescription(answer);
+      // Validate answer
+      if (!answer || !answer.type || !answer.sdp) {
+        console.error(`[PeerManager] Invalid answer from ${peerId}:`, {
+          hasAnswer: !!answer,
+          type: answer?.type,
+          hasSdp: !!answer?.sdp,
+          sdpLength: answer?.sdp?.length || 0
+        });
+        this.disconnectPeer(peerId);
+        return;
+      }
+
+      console.log(`[PeerManager] Received valid answer from ${peerId} (SDP length: ${answer.sdp.length})`);
+
+      // Check signaling state
+      const signalingState = peer.peerConnection.signalingState;
+      if (signalingState !== 'have-local-offer') {
+        console.warn(`[PeerManager] Unexpected signaling state for ${peerId}: ${signalingState}`);
+        if (signalingState === 'stable' || signalingState === 'closed') {
+          console.log(`[PeerManager] Ignoring answer for peer ${peerId} in ${signalingState} state`);
+          return;
+        }
+      }
+
+      await peer.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
       console.log(`[PeerManager] Set remote description for peer ${peerId}`);
     } catch (error) {
       console.error(`[PeerManager] Failed to set remote description for ${peerId}:`, error);
@@ -215,6 +293,13 @@ export class PeerManager {
     const peer = this.peers.get(peerId);
     if (!peer || !peer.peerConnection) {
       console.warn(`[PeerManager] Received ICE candidate for unknown peer ${peerId}`);
+      return;
+    }
+
+    // Check if peer connection is in a valid state for adding ICE candidates
+    const signalingState = peer.peerConnection.signalingState;
+    if (signalingState === 'closed') {
+      console.warn(`[PeerManager] Cannot add ICE candidate for closed peer ${peerId}`);
       return;
     }
 
@@ -271,11 +356,27 @@ export class PeerManager {
 
     dataChannel.onclose = () => {
       console.log(`[PeerManager] Data channel closed for ${peerId}`);
+      // Update connection state when data channel closes
+      peerInfo.connectionState = 'disconnected';
+      // Schedule cleanup to remove the peer
+      setTimeout(() => {
+        if (peerInfo.connectionState === 'disconnected') {
+          console.log(`[PeerManager] Cleaning up disconnected peer ${peerId}`);
+          this.disconnectPeer(peerId);
+        }
+      }, 1000); // Wait 1 second before cleanup
     };
 
     dataChannel.onerror = (error) => {
       console.error(`[PeerManager] Data channel error for ${peerId}:`, error);
+      // Update connection state on error
+      peerInfo.connectionState = 'failed';
       this.emit('fetchFailed', peerId, new Error('Data channel error'));
+      // Immediately disconnect failed peer
+      setTimeout(() => {
+        console.log(`[PeerManager] Cleaning up failed peer ${peerId}`);
+        this.disconnectPeer(peerId);
+      }, 500);
     };
 
     dataChannel.onmessage = (event) => {
@@ -348,21 +449,39 @@ export class PeerManager {
 
     // Get or connect to peer
     let peer = this.peers.get(peerId);
-    if (!peer || peer.connectionState !== 'connected') {
+    const isConnected = peer?.connectionState === 'connected' && 
+                       peer?.dataChannel?.readyState === 'open';
+    
+    if (!peer || !isConnected) {
       try {
         peer = await this.connectToPeer(peerId);
-        // Wait for connection to establish
-        await this.waitForConnection(peer, config.peerConnectionTimeout);
+        // Wait for connection to establish with shorter timeout (2s instead of 10s)
+        await this.waitForConnection(peer, Math.min(2000, config.peerConnectionTimeout));
       } catch (error) {
         console.error(`[PeerManager] Failed to connect to peer ${peerId}:`, error);
-        return this.fallbackToHttp(segment, startTime);
+        // Return error instead of falling back to HTTP
+        // Let IntegratedSegmentFetchClient handle the fallback
+        return {
+          success: false,
+          source: 'peer' as const,
+          peerId,
+          latency: Date.now() - startTime,
+          error: error instanceof Error ? error : new Error('Connection failed'),
+        };
       }
     }
 
     // Check if data channel is ready
     if (!peer.dataChannel || peer.dataChannel.readyState !== 'open') {
       console.warn(`[PeerManager] Data channel not ready for ${peerId}`);
-      return this.fallbackToHttp(segment, startTime);
+      // Return error instead of falling back to HTTP
+      return {
+        success: false,
+        source: 'peer' as const,
+        peerId,
+        latency: Date.now() - startTime,
+        error: new Error('Data channel not ready'),
+      };
     }
 
     try {
@@ -370,6 +489,18 @@ export class PeerManager {
       const staggerDelay = this.getStaggeredDelay();
       if (staggerDelay > 0) {
         await this.sleep(staggerDelay);
+      }
+
+      // Re-check data channel after delay (it might have closed)
+      if (!peer.dataChannel || peer.dataChannel.readyState !== 'open') {
+        console.warn(`[PeerManager] Data channel closed during delay for ${peerId}`);
+        return {
+          success: false,
+          source: 'peer' as const,
+          peerId,
+          latency: Date.now() - startTime,
+          error: new Error('Data channel closed'),
+        };
       }
 
       // Create request
@@ -381,11 +512,23 @@ export class PeerManager {
         qualityId: segment.qualityId,
       };
 
-      // Send request
-      peer.dataChannel.send(JSON.stringify(request));
+      // Send request with try-catch to handle send failures
+      try {
+        peer.dataChannel.send(JSON.stringify(request));
+      } catch (sendError) {
+        console.error(`[PeerManager] Failed to send request to ${peerId}:`, sendError);
+        return {
+          success: false,
+          source: 'peer' as const,
+          peerId,
+          latency: Date.now() - startTime,
+          error: sendError instanceof Error ? sendError : new Error('Failed to send request'),
+        };
+      }
 
-      // Wait for response with timeout
-      const data = await this.waitForSegmentData(requestId, peer, config.fetchTimeout);
+      // Wait for response with shorter timeout (3s instead of 8s for faster fallback)
+      const segmentTimeout = Math.min(3000, config.fetchTimeout);
+      const data = await this.waitForSegmentData(requestId, peer, segmentTimeout);
 
       // Update metrics - success
       const latency = Date.now() - startTime;
@@ -412,17 +555,41 @@ export class PeerManager {
       
       this.emit('fetchFailed', peerId, error as Error);
 
-      // Retry logic
-      if (retryCount < config.maxRetries) {
+      // Don't retry if data channel is not ready (it won't succeed)
+      const isChannelError = errorMessage.includes('Data channel') || 
+                            errorMessage.includes('send');
+      
+      if (isChannelError) {
+        console.log(`[PeerManager] Channel error detected, skipping retry for ${peerId}`);
+        return {
+          success: false,
+          source: 'peer' as const,
+          peerId,
+          latency: Date.now() - startTime,
+          error: error instanceof Error ? error : new Error('Channel error'),
+        };
+      }
+
+      // Retry logic with reduced retries for faster fallback
+      // Only retry once (reduce from 3 to 1) for faster fallback to HTTP
+      const maxRetries = 1;
+      if (retryCount < maxRetries) {
         const retryDelay = config.retryDelayBase * Math.pow(2, retryCount);
-        console.log(`[PeerManager] Retrying in ${retryDelay}ms (attempt ${retryCount + 1}/${config.maxRetries})`);
+        console.log(`[PeerManager] Retrying in ${retryDelay}ms (attempt ${retryCount + 1}/${maxRetries})`);
         await this.sleep(retryDelay);
         return this.fetchSegmentFromPeer(peerId, segment, retryCount + 1);
       }
 
-      // Max retries exceeded, fallback to HTTP
-      console.log(`[PeerManager] Max retries exceeded, falling back to HTTP`);
-      return this.fallbackToHttp(segment, startTime);
+      // Max retries exceeded, return error instead of falling back to HTTP
+      // Let IntegratedSegmentFetchClient handle the fallback
+      console.log(`[PeerManager] Max retries exceeded for peer ${peerId}`);
+      return {
+        success: false,
+        source: 'peer' as const,
+        peerId,
+        latency: Date.now() - startTime,
+        error: error instanceof Error ? error : new Error('Max retries exceeded'),
+      };
     }
   }
 
@@ -550,9 +717,8 @@ export class PeerManager {
    */
   private async fallbackToHttp(segment: SegmentMetadata, startTime: number): Promise<FetchResult> {
     try {
-      const url = segment.url || `${this.fallbackEndpoint}/${segment.qualityId}/${segment.id}.m4s`;
-      
-      console.log(`[PeerManager] Falling back to HTTP: ${url}`);
+      // segment.id already contains the full filename with extension (e.g., "seg_0001.m4s")
+      const url = this.configManager.getSeederUrl(segment.movieId, segment.qualityId,segment.id);
       
       const response = await fetch(url);
       if (!response.ok) {
@@ -669,8 +835,11 @@ export class PeerManager {
     const candidates: PeerScore[] = [];
 
     this.peers.forEach((peer, peerId) => {
-      // Only consider connected peers that have the segment
-      if (peer.connectionState === 'connected' && peer.availableSegments.has(segmentKey)) {
+      // Only consider connected peers with open data channel that have the segment
+      const isReady = peer.connectionState === 'connected' && 
+                     peer.dataChannel?.readyState === 'open';
+      
+      if (isReady && peer.availableSegments.has(segmentKey)) {
         const totalRequests = peer.metrics.successCount + peer.metrics.failureCount;
         const successRate = totalRequests > 0 
           ? peer.metrics.successCount / totalRequests 
@@ -742,6 +911,9 @@ export class PeerManager {
 
     console.log(`[PeerManager] Disconnecting peer ${peerId}`);
 
+    // Mark as disconnecting to prevent new operations
+    peer.connectionState = 'disconnected';
+
     // Clean up pending requests for this peer
     this.pendingRequests.forEach((request, requestId) => {
       clearTimeout(request.timeout);
@@ -749,12 +921,34 @@ export class PeerManager {
       this.pendingRequests.delete(requestId);
     });
 
-    // Close connections
+    // Clean up signaling debounce tracking
+    this.recentOffers.delete(peerId);
+    this.recentAnswers.delete(peerId);
+
+    // Close data channel first
     if (peer.dataChannel) {
-      peer.dataChannel.close();
+      try {
+        peer.dataChannel.close();
+      } catch (error) {
+        console.warn(`[PeerManager] Error closing data channel for ${peerId}:`, error);
+      }
+      peer.dataChannel = undefined;
     }
+
+    // Close peer connection
     if (peer.peerConnection) {
-      peer.peerConnection.close();
+      try {
+        // Remove event listeners to prevent callbacks during cleanup
+        peer.peerConnection.onicecandidate = null;
+        peer.peerConnection.oniceconnectionstatechange = null;
+        peer.peerConnection.onconnectionstatechange = null;
+        peer.peerConnection.ondatachannel = null;
+        
+        peer.peerConnection.close();
+      } catch (error) {
+        console.warn(`[PeerManager] Error closing peer connection for ${peerId}:`, error);
+      }
+      peer.peerConnection = undefined;
     }
 
     this.peers.delete(peerId);
@@ -787,6 +981,8 @@ export class PeerManager {
   getActivePeerCount(): number {
     let count = 0;
     this.peers.forEach(peer => {
+      // Count both connecting and connected peers for max limit
+      // But exclude failed/disconnected peers
       if (peer.connectionState === 'connected' || peer.connectionState === 'connecting') {
         count++;
       }
@@ -848,13 +1044,6 @@ export class PeerManager {
     segmentKeys.forEach(key => peer.availableSegments.add(key));
     
     console.log(`[PeerManager] Updated availability for ${peerId}: ${segmentKeys.length} segments`);
-  }
-
-  /**
-   * Set fallback endpoint for HTTP requests
-   */
-  setFallbackEndpoint(endpoint: string): void {
-    this.fallbackEndpoint = endpoint;
   }
 
   /**

@@ -14,7 +14,7 @@ export interface Quality {
 }
 
 export interface Segment {
-  id: number;
+  id: string;          // Format: "seg_0001.m4s"
   qualityId: string;
   duration: number;
   url: string;
@@ -23,12 +23,12 @@ export interface Segment {
 }
 
 export interface SegmentMetadata {
-  id: number;
+  id: string;          // Format: "seg_0001.m4s"
+  movieId: string;
   qualityId: string;
   duration: number;
   size?: number;
   timestamp: number;
-  url: string;
 }
 
 export interface InitSegment {
@@ -143,31 +143,143 @@ export interface FetchRequest {
 
 // ============ Signaling Types ============
 
-export interface WhoHasRequest {
+// Client -> Server message types
+export type ClientMessageType = 
+  | 'whoHas'          // Tìm peer có segment
+  | 'reportSegment'   // Báo cáo đã tải segment
+  | 'rtcOffer'        // WebRTC offer
+  | 'rtcAnswer'       // WebRTC answer
+  | 'iceCandidate';   // ICE candidate
+
+// Server -> Client message types
+export type ServerMessageType = 
+  | 'peerList'        // Danh sách peer khi connect
+  | 'whoHasReply'     // Kết quả tìm peer
+  | 'reportAck'       // Xác nhận báo cáo
+  | 'rtcOffer'        // Forward WebRTC offer
+  | 'rtcAnswer'       // Forward WebRTC answer
+  | 'iceCandidate'    // Forward ICE candidate
+  | 'error';          // Thông báo lỗi
+
+// Base signaling message
+export interface SignalingMessage {
+  type: ClientMessageType | ServerMessageType;
+  [key: string]: unknown; // Allow other fields
+}
+
+// ===== CLIENT -> SERVER MESSAGES =====
+
+// 1. whoHas - Tìm peer có segment
+export interface WhoHasRequest extends SignalingMessage {
+  type: 'whoHas';
   movieId: string;
   qualityId: string;
-  segmentId: number;
+  segmentId: string;  // Format: "seg_0001.m4s" (bao gồm cả extension)
 }
 
-export interface WhoHasResponse {
-  segmentKey: string;
-  peers: string[]; // Array of peerIds
-  requestId?: string; // For matching with request
+// 2. reportSegment - Báo cáo đã tải segment
+export interface ReportSegmentRequest extends SignalingMessage {
+  type: 'reportSegment';
+  movieId?: string;      // Optional, lấy từ session nếu không có
+  qualityId: string;
+  segmentId: string;     // Format: "seg_0001.m4s" (bao gồm cả extension)
+  source?: 'peer' | 'server';  // Default: "peer"
+  latency?: number;      // milliseconds, default: 0
+  speed?: number;        // Mbps, default: 0
 }
 
-export interface SegmentAvailabilityReport {
-  clientId: string;
-  movieId: string;
-  segments: Array<{
-    qualityId: string;
-    segmentId: number;
-  }>;
+// 3. rtcOffer - WebRTC offer
+export interface RtcOfferRequest extends SignalingMessage {
+  type: 'rtcOffer';
+  from?: string;         // Auto-set by server
+  to: string;            // Target peer clientId
+  streamId: string;      // Movie ID
+  sdp: string;           // WebRTC SDP
 }
 
-export interface SignalingMessage {
-  type: 'whoHas' | 'whoHasResponse' | 'segmentReport' | 'segmentFetchReport' | 'peerOffer' | 'peerAnswer' | 'iceCandidate' | 'error';
-  payload: unknown;
-  timestamp: number;
+// 4. rtcAnswer - WebRTC answer
+export interface RtcAnswerRequest extends SignalingMessage {
+  type: 'rtcAnswer';
+  from?: string;         // Auto-set by server
+  to: string;            // Target peer clientId
+  streamId: string;      // Movie ID
+  sdp: string;           // WebRTC SDP
+}
+
+// 5. iceCandidate - ICE candidate
+export interface IceCandidateRequest extends SignalingMessage {
+  type: 'iceCandidate';
+  from?: string;         // Auto-set by server
+  to: string;            // Target peer clientId
+  streamId: string;      // Movie ID
+  candidate: RTCIceCandidateInit;  // ICE candidate object
+}
+
+// ===== SERVER -> CLIENT MESSAGES =====
+
+// 1. peerList - Danh sách peer khi connect
+export interface PeerListMessage extends SignalingMessage {
+  type: 'peerList';
+  streamId: string;
+  peers: string[];       // Array of clientIds (không bao gồm chính client)
+}
+
+// 2. whoHasReply - Kết quả tìm peer
+export interface SignalingPeerMetrics {
+  uploadSpeed: number;   // Mbps
+  latency: number;       // milliseconds
+  successRate: number;   // 0.0 - 1.0
+  lastActive: number;    // Unix epoch milliseconds
+}
+
+export interface SignalingPeerInfo {
+  peerId: string;
+  metrics: SignalingPeerMetrics;
+}
+
+export interface WhoHasReplyMessage extends SignalingMessage {
+  type: 'whoHasReply';
+  segmentId: string;     // Format: "seg_0001.m4s" (bao gồm cả extension)
+  peers: SignalingPeerInfo[];     // Array of peers with metrics (có thể rỗng)
+}
+
+// 3. reportAck - Xác nhận báo cáo
+export interface ReportAckMessage extends SignalingMessage {
+  type: 'reportAck';
+  segmentId: string;     // Format: "seg_0001.m4s" (bao gồm cả extension)
+}
+
+// 4. rtcOffer forwarded from another peer
+export interface RtcOfferMessage extends SignalingMessage {
+  type: 'rtcOffer';
+  from: string;          // Sender peer clientId
+  to: string;            // Target peer clientId
+  streamId: string;
+  sdp: string;
+}
+
+// 5. rtcAnswer forwarded from another peer
+export interface RtcAnswerMessage extends SignalingMessage {
+  type: 'rtcAnswer';
+  from: string;          // Sender peer clientId
+  to: string;            // Target peer clientId
+  streamId: string;
+  sdp: string;
+}
+
+// 6. iceCandidate forwarded from another peer
+export interface IceCandidateMessage extends SignalingMessage {
+  type: 'iceCandidate';
+  from: string;          // Sender peer clientId
+  to: string;            // Target peer clientId
+  streamId: string;
+  candidate: RTCIceCandidateInit;
+}
+
+// 7. error - Thông báo lỗi
+export interface ErrorMessage extends SignalingMessage {
+  type: 'error';
+  message: string;
 }
 
 // ============ Player State Types ============
@@ -282,7 +394,7 @@ export interface PeerEvent extends PlayerEvent {
 
 // ============ Utility Types ============
 
-export type SegmentKey = `${string}:${number}`; // qualityId:segmentId
+export type SegmentKey = `${string}:${string}`; // qualityId:segmentId (e.g., "720p:seg_0001.m4s")
 
 export interface TimeRange {
   start: number;
@@ -294,4 +406,44 @@ export interface SegmentRequest {
   priority: number;
   onSuccess: (data: ArrayBuffer, source: FetchSource) => void;
   onError: (error: Error) => void;
+}
+
+// ============ Helper Functions ============
+
+/**
+ * Format segment numeric index to standard segment ID string
+ * @param index - Segment index (0-based or 1-based)
+ * @returns Formatted segment ID string (e.g., "seg_0001.m4s")
+ */
+export function formatSegmentId(index: number): string {
+  return `seg_${String(index).padStart(4, '0')}.m4s`;
+}
+
+/**
+ * Parse segment ID to extract numeric index
+ * @param segmentId - Segment ID (e.g., "seg_0001.m4s" or "42.m4s")
+ * @returns Numeric index
+ */
+export function parseSegmentIndex(segmentId: string): number {
+  const newFormatMatch = segmentId.match(/seg_(\d+)\.m4s/);
+  const oldFormatMatch = segmentId.match(/(\d+)\.m4s/);
+  
+  if (newFormatMatch) {
+    return parseInt(newFormatMatch[1], 10);
+  } else if (oldFormatMatch) {
+    return parseInt(oldFormatMatch[1], 10);
+  }
+  
+  return 0;
+}
+
+/**
+ * Compare two segment IDs for ordering
+ * Can compare strings directly since format is zero-padded
+ * @param a - First segment ID
+ * @param b - Second segment ID  
+ * @returns Negative if a < b, positive if a > b, 0 if equal
+ */
+export function compareSegmentIds(a: string, b: string): number {
+  return a.localeCompare(b);
 }

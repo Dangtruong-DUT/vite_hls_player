@@ -1,37 +1,39 @@
 /**
  * SignalingClient
  * 
- * Advanced WebSocket signaling client with:
- * - WhoHas query based on streamId (movieId) and segmentId for seek position
- * - Report successful segment fetches (from peer or seeder) to update Redis
- * - Redis updates so swarm knows which peers have which segments
- * - Timeout support with HTTP fallback on slow signaling
- * - Seeder endpoint knowledge for HTTP fallback: /api/streams/movies/...
+ * WebSocket signaling client theo Streaming Signaling Protocol v1.0.0
+ * - whoHas: Tìm peer có segment
+ * - reportSegment: Báo cáo đã tải segment với metrics
+ * - WebRTC signaling: rtcOffer, rtcAnswer, iceCandidate
+ * - Nhận peerList, whoHasReply, reportAck từ server
  */
 
-import type { WhoHasRequest, WhoHasResponse, SegmentAvailabilityReport, SignalingMessage, FetchSource } from './types';
+import type { 
+  WhoHasRequest,
+  WhoHasReplyMessage,
+  PeerListMessage,
+  ReportAckMessage,
+  ReportSegmentRequest,
+  RtcOfferRequest,
+  RtcOfferMessage,
+  RtcAnswerRequest,
+  RtcAnswerMessage,
+  IceCandidateRequest,
+  IceCandidateMessage,
+  ErrorMessage
+} from './types';
 import { ConfigManager } from './ConfigManager';
 
 export interface SignalingClientEvents {
   connected: () => void;
   disconnected: () => void;
   error: (error: Error) => void;
-  whoHasResponse: (response: WhoHasResponse) => void;
-  peerOffer: (data: { peerId: string; offer: RTCSessionDescriptionInit }) => void;
-  peerAnswer: (data: { peerId: string; answer: RTCSessionDescriptionInit }) => void;
-  iceCandidate: (data: { peerId: string; candidate: RTCIceCandidateInit }) => void;
-  timeoutFallback: (segmentId: number, qualityId: string) => void;
-}
-
-interface SegmentFetchReport {
-  clientId: string;
-  movieId: string;
-  segmentId: number;
-  qualityId: string;
-  source: FetchSource; // 'peer' or 'seeder'
-  timestamp: number;
-  latency?: number;
-  peerId?: string; // If fetched from peer
+  whoHasReply: (response: WhoHasReplyMessage) => void;
+  peerList: (data: PeerListMessage) => void;
+  reportAck: (data: ReportAckMessage) => void;
+  rtcOffer: (data: RtcOfferMessage) => void;
+  rtcAnswer: (data: RtcAnswerMessage) => void;
+  iceCandidate: (data: IceCandidateMessage) => void;
 }
 
 export class SignalingClient {
@@ -43,10 +45,15 @@ export class SignalingClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, {
-    resolve: (value: WhoHasResponse) => void;
+    resolve: (value: WhoHasReplyMessage) => void;
     reject: (error: Error) => void;
     timeout: ReturnType<typeof setTimeout>;
     startTime: number;
+  }>();
+  // Cache whoHas responses to prevent duplicate queries
+  private whoHasCache = new Map<string, {
+    response: WhoHasReplyMessage;
+    timestamp: number;
   }>();
   private eventListeners: Partial<SignalingClientEvents> = {};
   private seederEndpoint: string;
@@ -62,7 +69,7 @@ export class SignalingClient {
     this.movieId = movieId;
     this.configManager = configManager;
     this.seederEndpoint = seederEndpoint;
-    this.signalingUrl = `ws://localhost:8080/signaling?clientId=${clientId}&movieId=${movieId}`;
+    this.signalingUrl = `ws://localhost:8080/ws/signaling?clientId=${clientId}&movieId=${movieId}`;
   }
 
   /**
@@ -137,22 +144,30 @@ export class SignalingClient {
   }
 
   /**
-   * Query WhoHas based on streamId (movieId) and segmentId
-   * Used to find peers that have a specific segment, especially for seek positions
+   * Query whoHas - Tìm peer có segment
+   * Protocol: Client -> Server message type 'whoHas'
    * 
-   * @param qualityId - Quality level ID
-   * @param segmentId - Segment ID (corresponds to seek position)
-   * @returns Promise<WhoHasResponse> with list of peer IDs that have the segment
-   * @throws Error if timeout occurs (triggers HTTP fallback)
+   * @param qualityId - Quality level (ví dụ: "720p")
+   * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
+   * @returns Promise với list of peers có segment
    */
-  async whoHas(qualityId: string, segmentId: number): Promise<WhoHasResponse> {
+  async whoHas(qualityId: string, segmentId: string): Promise<WhoHasReplyMessage> {
     if (!this.isConnected) {
-      console.warn('[SignalingClient] Not connected, cannot query WhoHas');
+      console.warn('[SignalingClient] Not connected, cannot query whoHas');
       throw new Error('Not connected to signaling server');
     }
 
+    // Check cache first (cache for 5 seconds)
+    const cacheKey = `${this.movieId}_${qualityId}_${segmentId}`;
+    const cached = this.whoHasCache.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 5000) {
+      console.log(`[SignalingClient] Using cached whoHas result for ${segmentId} (${cached.response.peers.length} peers)`);
+      return cached.response;
+    }
+
     const request: WhoHasRequest = {
-      movieId: this.movieId, // streamId for query
+      type: 'whoHas',
+      movieId: this.movieId,
       qualityId,
       segmentId,
     };
@@ -161,119 +176,86 @@ export class SignalingClient {
     const config = this.configManager.getConfig();
     const startTime = Date.now();
 
-    console.log(`[SignalingClient] WhoHas query: movieId=${this.movieId}, ` +
+    console.log(`[SignalingClient] whoHas query: movieId=${this.movieId}, ` +
                 `qualityId=${qualityId}, segmentId=${segmentId}`);
 
     return new Promise((resolve, reject) => {
-      // Set timeout - will trigger HTTP fallback
+      // Set timeout
       const timeout = setTimeout(() => {
         this.pendingRequests.delete(requestId);
         const elapsed = Date.now() - startTime;
-        console.warn(`[SignalingClient] WhoHas timeout after ${elapsed}ms for segment ${segmentId}`);
+        console.warn(`[SignalingClient] whoHas timeout after ${elapsed}ms for segment ${segmentId}`);
         
-        // Emit timeout event for HTTP fallback
-        this.emit('timeoutFallback', segmentId, qualityId);
-        
-        reject(new Error(`WhoHas timeout for segment ${qualityId}:${segmentId} after ${elapsed}ms`));
+        reject(new Error(`whoHas timeout for segment ${qualityId}:${segmentId} after ${elapsed}ms`));
       }, config.whoHasTimeout);
 
       this.pendingRequests.set(requestId, { 
-        resolve, 
+        resolve: (response) => {
+          // Cache the response
+          this.whoHasCache.set(cacheKey, {
+            response,
+            timestamp: Date.now()
+          });
+          resolve(response);
+        }, 
         reject, 
         timeout,
         startTime 
       });
 
-      // Send WhoHas message
-      this.send({
-        type: 'whoHas',
-        payload: { ...request, requestId },
-        timestamp: Date.now(),
-      });
+      // Send whoHas message theo protocol
+      this.send(request);
     });
   }
 
   /**
-   * Report successful segment fetch to update Redis
-   * Lets the swarm know which peers have which segments
+   * Report segment - Báo cáo đã tải segment
+   * Protocol: Client -> Server message type 'reportSegment'
    * 
-   * @param segmentId - Segment ID that was fetched
-   * @param qualityId - Quality level ID
-   * @param source - Source of fetch: 'peer' or 'seeder'
-   * @param peerId - Peer ID if fetched from peer
-   * @param latency - Fetch latency in ms (optional)
+   * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
+   * @param qualityId - Quality level
+   * @param source - Nguồn: 'peer' hoặc 'server'
+   * @param latency - Thời gian tải (ms)
+   * @param speed - Tốc độ tải (Mbps)
    */
   reportSegmentFetch(
-    segmentId: number,
+    segmentId: string,
     qualityId: string,
-    source: FetchSource,
-    peerId?: string,
-    latency?: number
+    source: 'peer' | 'server' = 'peer',
+    latency?: number,
+    speed?: number
   ): void {
     if (!this.isConnected) {
-      console.warn('[SignalingClient] Not connected, cannot report segment fetch');
+      console.warn('[SignalingClient] Not connected, cannot report segment');
       return;
     }
 
-    const report: SegmentFetchReport = {
-      clientId: this.clientId,
-      movieId: this.movieId,
-      segmentId,
+    const report: ReportSegmentRequest = {
+      type: 'reportSegment',
+      movieId: this.movieId,  // Optional trong protocol nhưng gửi để chắc chắn
       qualityId,
+      segmentId,
       source,
-      timestamp: Date.now(),
       latency,
-      peerId,
+      speed,
     };
 
-    console.log(`[SignalingClient] Reporting segment fetch: ${qualityId}:${segmentId} from ${source}` +
-                (peerId ? ` (peer: ${peerId})` : ''));
+    console.log(`[SignalingClient] Reporting segment: ${qualityId}:${segmentId} from ${source}` +
+                (latency ? ` (latency: ${latency}ms)` : '') +
+                (speed ? ` (speed: ${speed}Mbps)` : ''));
 
-    this.send({
-      type: 'segmentFetchReport',
-      payload: report,
-      timestamp: Date.now(),
-    });
-  }
-
-  /**
-   * Report segment availability to update Redis
-   * Used to advertise which segments this client has available
-   * Updates Redis so other peers can discover this client's segments
-   * 
-   * @param segments - Array of segments this client has
-   */
-  reportSegmentAvailability(segments: Array<{ qualityId: string; segmentId: number }>): void {
-    if (!this.isConnected) {
-      console.warn('[SignalingClient] Not connected, cannot report availability');
-      return;
-    }
-
-    const report: SegmentAvailabilityReport = {
-      clientId: this.clientId,
-      movieId: this.movieId,
-      segments,
-    };
-
-    console.log(`[SignalingClient] Reporting ${segments.length} available segments for movieId=${this.movieId}`);
-
-    this.send({
-      type: 'segmentReport',
-      payload: report,
-      timestamp: Date.now(),
-    });
+    this.send(report);
   }
 
   /**
    * Get seeder endpoint URL for HTTP fallback
-   * Format: /api/streams/movies/{movieId}/{qualityId}/{segmentId}.m4s
    * 
    * @param qualityId - Quality level ID
-   * @param segmentId - Segment ID
-   * @returns Full URL to fetch from seeder
+   * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
+   * @returns Full URL to fetch from seeder (e.g., /api/streams/movies/{movieId}/{qualityId}/seg_0001.m4s)
    */
-  getSeederUrl(qualityId: string, segmentId: number): string {
-    return `${this.seederEndpoint}/${this.movieId}/${qualityId}/${segmentId}.m4s`;
+  getSeederUrl(qualityId: string, segmentId: string): string {
+    return `${this.seederEndpoint}/${this.movieId}/${qualityId}/${segmentId}`;
   }
 
   /**
@@ -286,60 +268,66 @@ export class SignalingClient {
 
   /**
    * Send WebRTC offer to peer
+   * Protocol: Client -> Server message type 'rtcOffer'
    */
   sendOffer(peerId: string, offer: RTCSessionDescriptionInit): void {
-    this.send({
-      type: 'peerOffer',
-      payload: { 
-        senderId: this.clientId,
-        targetPeerId: peerId, 
-        offer 
-      },
-      timestamp: Date.now(),
-    });
+    const message: RtcOfferRequest = {
+      type: 'rtcOffer',
+      to: peerId,
+      streamId: this.movieId,
+      sdp: offer.sdp || '',
+    };
+    
+    console.log(`[SignalingClient] Sending rtcOffer to ${peerId}`);
+    this.send(message);
   }
 
   /**
    * Send WebRTC answer to peer
+   * Protocol: Client -> Server message type 'rtcAnswer'
    */
   sendAnswer(peerId: string, answer: RTCSessionDescriptionInit): void {
-    this.send({
-      type: 'peerAnswer',
-      payload: { 
-        senderId: this.clientId,
-        targetPeerId: peerId, 
-        answer 
-      },
-      timestamp: Date.now(),
-    });
+    const message: RtcAnswerRequest = {
+      type: 'rtcAnswer',
+      to: peerId,
+      streamId: this.movieId,
+      sdp: answer.sdp || '',
+    };
+    
+    console.log(`[SignalingClient] Sending rtcAnswer to ${peerId}`);
+    this.send(message);
   }
 
   /**
    * Send ICE candidate to peer
+   * Protocol: Client -> Server message type 'iceCandidate'
    */
   sendIceCandidate(peerId: string, candidate: RTCIceCandidateInit): void {
-    this.send({
+    const message: IceCandidateRequest = {
       type: 'iceCandidate',
-      payload: { 
-        senderId: this.clientId,
-        targetPeerId: peerId, 
-        candidate 
-      },
-      timestamp: Date.now(),
-    });
+      to: peerId,
+      streamId: this.movieId,
+      candidate,
+    };
+    
+    console.log(`[SignalingClient] Sending iceCandidate to ${peerId}`);
+    this.send(message);
   }
 
   /**
    * Send message through WebSocket
+   * Messages theo Streaming Signaling Protocol đã có type field
    */
-  private send(message: SignalingMessage): void {
+  private send(message: Record<string, unknown>): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.warn('[SignalingClient] Cannot send message, WebSocket not open');
       return;
     }
 
     try {
-      this.ws.send(JSON.stringify(message));
+      const payload = JSON.stringify(message);
+      console.log('[SignalingClient] Sending message:', payload);
+      this.ws.send(payload);
     } catch (error) {
       console.error('[SignalingClient] Error sending message:', error);
       this.emit('error', error as Error);
@@ -348,74 +336,93 @@ export class SignalingClient {
 
   /**
    * Handle incoming message from signaling server
+   * Parse theo Streaming Signaling Protocol
    */
   private handleMessage(data: string): void {
     try {
-      const message: SignalingMessage & { payload: any } = JSON.parse(data);
+      const message = JSON.parse(data) as Record<string, any>;
+      const messageType = message.type as string;
 
-      switch (message.type) {
-        case 'whoHasResponse':
-          this.handleWhoHasResponse(message.payload);
+      if (!messageType) {
+        console.error('[SignalingClient] Message missing type field:', message);
+        return;
+      }
+
+      switch (messageType) {
+        case 'whoHasReply':
+          this.handleWhoHasReply(message as WhoHasReplyMessage);
           break;
 
-        case 'peerOffer':
-          this.emit('peerOffer', {
-            peerId: message.payload.senderId || message.payload.peerId,
-            offer: message.payload.offer
-          });
+        case 'peerList':
+          this.emit('peerList', message as PeerListMessage);
           break;
 
-        case 'peerAnswer':
-          this.emit('peerAnswer', {
-            peerId: message.payload.senderId || message.payload.peerId,
-            answer: message.payload.answer
-          });
+        case 'reportAck':
+          this.emit('reportAck', message as ReportAckMessage);
+          break;
+
+        case 'rtcOffer':
+          // Forward RTC message
+          this.emit('rtcOffer', message as RtcOfferMessage);
+          break;
+
+        case 'rtcAnswer':
+          this.emit('rtcAnswer', message as RtcAnswerMessage);
           break;
 
         case 'iceCandidate':
-          this.emit('iceCandidate', {
-            peerId: message.payload.senderId || message.payload.peerId,
-            candidate: message.payload.candidate
-          });
+          this.emit('iceCandidate', message as IceCandidateMessage);
           break;
 
         case 'error':
-          console.error('[SignalingClient] Server error:', message.payload);
-          this.emit('error', new Error(message.payload.message || 'Server error'));
+          const errorMsg = message as ErrorMessage;
+          console.error('[SignalingClient] Server error:', errorMsg.message);
+          this.handleServerError(errorMsg);
           break;
 
         default:
-          console.warn('[SignalingClient] Unknown message type:', message.type);
+          console.warn('[SignalingClient] Unknown message type:', messageType, message);
       }
     } catch (error) {
-      console.error('[SignalingClient] Error parsing message:', error);
+      console.error('[SignalingClient] Error parsing message:', error, 'Raw data:', data);
       this.emit('error', new Error('Failed to parse signaling message'));
     }
   }
 
   /**
-   * Handle WhoHas response from signaling server
-   * Updates Redis knowledge of segment distribution across swarm
+   * Handle whoHasReply from signaling server
+   * Protocol: Server -> Client message type 'whoHasReply'
    */
-  private handleWhoHasResponse(response: WhoHasResponse & { requestId?: string }): void {
-    const requestId = response.requestId;
-    
-    if (requestId) {
-      const pending = this.pendingRequests.get(requestId);
-      if (pending) {
+  private handleWhoHasReply(message: WhoHasReplyMessage): void {
+    console.log(`[SignalingClient] whoHasReply for ${message.segmentId}: ` +
+                `${message.peers.length} peers found`);
+
+    // Try to match with pending request by segmentId
+    for (const [requestId, pending] of this.pendingRequests.entries()) {
+      if (requestId.includes(message.segmentId)) {
         const elapsed = Date.now() - pending.startTime;
         clearTimeout(pending.timeout);
         
-        console.log(`[SignalingClient] WhoHas response received in ${elapsed}ms: ` +
-                    `${response.peers.length} peers have segment ${response.segmentKey}`);
-        
-        pending.resolve(response);
+        console.log(`[SignalingClient] Matched request ${requestId} in ${elapsed}ms`);
+        pending.resolve(message);
         this.pendingRequests.delete(requestId);
+        break;
       }
     }
 
     // Also emit event for general listeners
-    this.emit('whoHasResponse', response);
+    this.emit('whoHasReply', message);
+  }
+
+  /**
+   * Handle error message from server
+   * Protocol: Server -> Client message type 'error'
+   */
+  private handleServerError(errorMsg: ErrorMessage): void {
+    console.error('[SignalingClient] Server error:', errorMsg.message);
+    
+    // Emit general error event
+    this.emit('error', new Error(errorMsg.message));
   }
 
   /**
@@ -424,15 +431,18 @@ export class SignalingClient {
   private startHeartbeat(): void {
     const config = this.configManager.getConfig();
     
+    // Skip heartbeat if interval is 0 or negative
+    if (config.signalingHeartbeatInterval <= 0) {
+      console.log('[SignalingClient] Heartbeat disabled (interval <= 0)');
+      return;
+    }
+    
     this.heartbeatTimer = setInterval(() => {
       if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.send({
-          type: 'whoHas', // Reuse whoHas type for heartbeat
-          payload: { 
-            heartbeat: true,
-            clientId: this.clientId,
-            movieId: this.movieId 
-          },
+          type: 'ping', // Use ping type for heartbeat
+          clientId: this.clientId,
+          movieId: this.movieId,
           timestamp: Date.now(),
         });
       }

@@ -136,6 +136,7 @@ export class StreamingPlayerCoordinator {
           segment,
           priority: critical ? 100 : 50,
           forSeek: false,
+          critical: critical, // Pass critical flag to skip P2P when buffer is critically low
         });
 
         if (result.success && result.data) {
@@ -194,15 +195,20 @@ export class StreamingPlayerCoordinator {
       this.reportAvailableSegments();
     });
 
-    this.signalingClient.on('whoHasResponse', (response) => {
-      console.log(`[Coordinator] WhoHas response for ${response.segmentKey}:`, response.peers);
+    this.signalingClient.on('whoHasReply', (message) => {
+      console.log(`[Coordinator] WhoHas reply for ${message.segmentId}:`, message.peers);
       
       // Update peer availability information
-      if (response.peers && response.peers.length > 0) {
-        response.peers.forEach(peerId => {
-          this.peerManager.updatePeerSegmentAvailability(peerId, [response.segmentKey]);
+      if (message.peers && message.peers.length > 0) {
+        message.peers.forEach(peer => {
+          this.peerManager.updatePeerSegmentAvailability(peer.peerId, [message.segmentId]);
         });
       }
+    });
+
+    this.signalingClient.on('peerList', (message) => {
+      console.log(`[Coordinator] Received peer list:`, message.peers);
+      // Handle initial peer list from server
     });
 
     // Peer events
@@ -242,9 +248,9 @@ export class StreamingPlayerCoordinator {
     try {
       console.log('[Coordinator] Initializing streaming player...');
 
-      // Connect to signaling server (temporarily disabled for testing)
-      // await this.signalingClient.connect();
-      console.log('[Coordinator] Skipping signaling connection for testing...');
+      // Connect to signaling server
+      await this.signalingClient.connect();
+      console.log(`[Coordinator] Connected to signaling server`);
 
       // Fetch master playlist
       const masterPlaylist = await this.segmentFetcher.fetchMasterPlaylist();
@@ -324,7 +330,9 @@ export class StreamingPlayerCoordinator {
       })
       .filter((seg): seg is { qualityId: string; segmentId: number } => seg !== null);
 
-    this.signalingClient.reportSegmentAvailability(segments);
+    // Note: reportSegmentAvailability has been replaced with individual reportSegment calls
+    // Segments are reported as they are fetched via signalingClient.reportSegmentFetch()
+    console.log(`[Coordinator] ${segments.length} segments available (reported individually on fetch)`);
   }
 
   /**
