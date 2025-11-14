@@ -373,7 +373,7 @@ export class ConfigManager {
       
       default:
         // Assume resource is a segment ID with extension (e.g., "seg_0001.m4s")
-        return `${base}/movies/${movieId}/${qualityId}/segments/${resource}`;
+        return `${base}/movies/${movieId}/${qualityId}/${resource}`;
     }
   }
 

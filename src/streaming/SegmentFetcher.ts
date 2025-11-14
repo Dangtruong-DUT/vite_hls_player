@@ -174,7 +174,7 @@ export class SegmentFetcher {
     const timeout = options.timeout ?? config.fetchTimeout;
     const maxRetries = options.retries ?? config.maxRetries;
 
-    const url = `${config.baseUrl}/streams/movies/${this.movieId}/${segment.qualityId}/segments/${segment.id}`;
+    const url = `${config.baseUrl}/streams/movies/${this.movieId}/${segment.qualityId}/${segment.id}`;
     const fetchKey = `${segment.qualityId}:${segment.id}`;
 
     let lastError: Error | null = null;
