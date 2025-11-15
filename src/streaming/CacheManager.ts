@@ -130,8 +130,6 @@ export class CacheManager {
     
     this.currentSize += size;
     this.updateStats();
-
-    console.log(`[CacheManager] Cached ${key} (${this.formatSize(size)}, hot: ${isHot})`);
   }
 
   /**

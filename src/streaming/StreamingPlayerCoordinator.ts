@@ -98,8 +98,10 @@ export class StreamingPlayerCoordinator {
 
     // Initialize peer manager
     this.peerManager = new PeerManager(
+      this.movieId,
       this.signalingClient,
-      this.configManager
+      this.configManager,
+      this.cacheManager
     );
 
     // Initialize integrated fetch client

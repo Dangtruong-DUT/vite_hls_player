@@ -15,6 +15,7 @@
 import type { PeerInfo, PeerScore, SegmentMetadata, FetchResult } from './types';
 import { SignalingClient } from './SignalingClient';
 import { ConfigManager } from './ConfigManager';
+import { CacheManager } from './CacheManager';
 
 export interface PeerManagerEvents {
   peerConnected: (peerId: string) => void;
@@ -30,11 +31,16 @@ interface PendingSegmentRequest {
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
   startTime: number;
+  chunks?: ArrayBuffer[]; // For receiving chunked data
+  totalChunks?: number;
+  receivedChunks?: number;
 }
 
 export class PeerManager {
   private configManager: ConfigManager;
   private signalingClient: SignalingClient;
+  private cacheManager: CacheManager;
+  private movieId: string;
   private peers = new Map<string, PeerInfo>();
   private pendingRequests = new Map<string, PendingSegmentRequest>(); // requestId -> request
   private iceServers: RTCIceServer[] = [
@@ -50,11 +56,15 @@ export class PeerManager {
   private readonly SIGNALING_DEBOUNCE_MS = 500; // Ignore duplicates within 500ms
 
   constructor(
+    movieId: string,
     signalingClient: SignalingClient, 
-    configManager: ConfigManager
+    configManager: ConfigManager,
+    cacheManager: CacheManager
   ) {
+    this.movieId = movieId;
     this.signalingClient = signalingClient;
     this.configManager = configManager;
+    this.cacheManager = cacheManager;
     this.setupSignalingListeners();
   }
 
@@ -402,6 +412,11 @@ export class PeerManager {
           });
         }
         
+        // Handle incoming segment request - THIS IS THE KEY FIX!
+        else if (message.type === 'segmentRequest') {
+          this.handleIncomingSegmentRequest(peerInfo, message);
+        }
+        
         // Handle error responses
         else if (message.type === 'error') {
           const requestId = message.requestId;
@@ -418,17 +433,154 @@ export class PeerManager {
     } 
     // Handle binary segment data
     else if (data instanceof ArrayBuffer) {
-      // Extract requestId from first 4 bytes (simple protocol)
+      // Protocol: [requestId:4][chunkIndex:4][totalChunks:4][data...]
       const view = new DataView(data);
       const requestId = view.getUint32(0, true).toString();
-      const segmentData = data.slice(4);
+      const chunkIndex = view.getUint32(4, true);
+      const totalChunks = view.getUint32(8, true);
+      const segmentData = data.slice(12);
       
       const pending = this.pendingRequests.get(requestId);
       if (pending) {
-        clearTimeout(pending.timeout);
-        this.pendingRequests.delete(requestId);
-        pending.resolve(segmentData);
+        // Handle chunked transfer
+        if (totalChunks > 1) {
+          if (!pending.chunks) {
+            pending.chunks = new Array(totalChunks);
+            pending.totalChunks = totalChunks;
+            pending.receivedChunks = 0;
+          }
+          
+          pending.chunks[chunkIndex] = segmentData;
+          pending.receivedChunks!++;
+          
+          // Check if all chunks received
+          if (pending.receivedChunks === totalChunks) {
+            // Combine all chunks
+            const totalSize = pending.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+            const combined = new ArrayBuffer(totalSize);
+            const combinedView = new Uint8Array(combined);
+            let offset = 0;
+            
+            for (const chunk of pending.chunks) {
+              combinedView.set(new Uint8Array(chunk), offset);
+              offset += chunk.byteLength;
+            }
+            
+            clearTimeout(pending.timeout);
+            this.pendingRequests.delete(requestId);
+            pending.resolve(combined);
+          }
+        } else {
+          // Single chunk - resolve immediately
+          clearTimeout(pending.timeout);
+          this.pendingRequests.delete(requestId);
+          pending.resolve(segmentData);
+        }
       }
+    }
+  }
+
+  /**
+   * Handle incoming segment request from another peer
+   * Fetch segment from cache and send it back
+   */
+  private async handleIncomingSegmentRequest(
+    peerInfo: PeerInfo,
+    message: { requestId: string; segmentId: string; qualityId: string }
+  ): Promise<void> {
+    const { requestId, segmentId, qualityId } = message;
+    const { peerId, dataChannel } = peerInfo;
+
+    console.log(`[PeerManager] Received segment request from ${peerId}: ${qualityId}:${segmentId} (requestId: ${requestId})`);
+
+    // Check if data channel is still open
+    if (!dataChannel || dataChannel.readyState !== 'open') {
+      console.warn(`[PeerManager] Cannot respond to ${peerId}, data channel not open`);
+      return;
+    }
+
+    try {
+      // Get segment from cache
+      const movieId = this.movieId;
+      const segmentData = this.cacheManager.getSegment(movieId, qualityId, segmentId);
+
+      if (!segmentData) {
+        console.warn(`[PeerManager] Don't have segment ${qualityId}:${segmentId} to send to ${peerId}`);
+        // Send error response
+        const errorResponse = {
+          type: 'error',
+          requestId,
+          error: 'Segment not found in cache',
+        };
+        dataChannel.send(JSON.stringify(errorResponse));
+        return;
+      }
+
+      // Send segment data with chunking for large segments
+      await this.sendSegmentChunked(dataChannel, parseInt(requestId, 10), segmentData);
+      console.log(`[PeerManager] Sent segment ${qualityId}:${segmentId} to ${peerId} (${segmentData.byteLength} bytes)`);
+
+    } catch (error) {
+      console.error(`[PeerManager] Failed to handle segment request from ${peerId}:`, error);
+      // Try to send error response
+      try {
+        const errorResponse = {
+          type: 'error',
+          requestId,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        };
+        if (dataChannel && dataChannel.readyState === 'open') {
+          dataChannel.send(JSON.stringify(errorResponse));
+        }
+      } catch (sendError) {
+        console.error(`[PeerManager] Failed to send error response:`, sendError);
+      }
+    }
+  }
+
+  /**
+   * Send segment data in chunks to avoid WebRTC data channel buffer overflow
+   * Protocol: [requestId:4][chunkIndex:4][totalChunks:4][data...]
+   */
+  private async sendSegmentChunked(
+    dataChannel: RTCDataChannel,
+    requestId: number,
+    segmentData: ArrayBuffer
+  ): Promise<void> {
+    const CHUNK_SIZE = 16384; // 16KB chunks (safe for WebRTC)
+    const MAX_BUFFER_SIZE = 65536; // 64KB buffer threshold
+    
+    const totalSize = segmentData.byteLength;
+    const totalChunks = Math.ceil(totalSize / CHUNK_SIZE);
+    const segmentView = new Uint8Array(segmentData);
+
+    for (let i = 0; i < totalChunks; i++) {
+      // Check if data channel is still open
+      if (dataChannel.readyState !== 'open') {
+        throw new Error('Data channel closed during transfer');
+      }
+
+      // Wait if buffer is getting full (backpressure)
+      while (dataChannel.bufferedAmount > MAX_BUFFER_SIZE) {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        if (dataChannel.readyState !== 'open') {
+          throw new Error('Data channel closed while waiting for buffer');
+        }
+      }
+
+      const start = i * CHUNK_SIZE;
+      const end = Math.min(start + CHUNK_SIZE, totalSize);
+      const chunkData = segmentView.slice(start, end);
+
+      // Prepare chunk: [requestId:4][chunkIndex:4][totalChunks:4][data...]
+      const chunk = new ArrayBuffer(12 + chunkData.byteLength);
+      const view = new DataView(chunk);
+      view.setUint32(0, requestId, true);
+      view.setUint32(4, i, true);
+      view.setUint32(8, totalChunks, true);
+      new Uint8Array(chunk, 12).set(chunkData);
+
+      dataChannel.send(chunk);
     }
   }
 
@@ -484,6 +636,19 @@ export class PeerManager {
       };
     }
 
+    // Verify peer has the segment
+    const segmentKey = `${segment.qualityId}:${segment.id}`;
+    if (!peer.availableSegments.has(segmentKey)) {
+      console.warn(`[PeerManager] Peer ${peerId} doesn't have segment ${segmentKey}`);
+      return {
+        success: false,
+        source: 'peer' as const,
+        peerId,
+        latency: Date.now() - startTime,
+        error: new Error('Peer does not have segment'),
+      };
+    }
+
     try {
       // Apply staggered delay
       const staggerDelay = this.getStaggeredDelay();
@@ -526,7 +691,7 @@ export class PeerManager {
         };
       }
 
-      // Wait for response with shorter timeout (3s instead of 8s for faster fallback)
+      // Wait for response with 3s timeout for fast fallback to HTTP
       const segmentTimeout = Math.min(3000, config.fetchTimeout);
       const data = await this.waitForSegmentData(requestId, peer, segmentTimeout);
 
@@ -571,8 +736,8 @@ export class PeerManager {
       }
 
       // Retry logic with reduced retries for faster fallback
-      // Only retry once (reduce from 3 to 1) for faster fallback to HTTP
-      const maxRetries = 1;
+      // Don't retry on timeout - fail fast and let HTTP take over
+      const maxRetries = 0;
       if (retryCount < maxRetries) {
         const retryDelay = config.retryDelayBase * Math.pow(2, retryCount);
         console.log(`[PeerManager] Retrying in ${retryDelay}ms (attempt ${retryCount + 1}/${maxRetries})`);

@@ -135,18 +135,22 @@ export class IntegratedSegmentFetchClient {
     const fetchTimeout = config.fetchTimeout; // Use configured fetchTimeout
     
     const fetchPromise = this.executeSegmentFetch(segment, forSeek);
-    const timeoutPromise = new Promise<FetchResult>((_, reject) => {
-      setTimeout(() => {
-        reject(new Error(`Segment fetch timeout for ${segmentKey} after ${fetchTimeout}ms`));
-      }, fetchTimeout);
-    });
+    
+    // For critical segments, skip timeout to ensure HTTP completes
+    // Critical segments are needed immediately for playback
+    const racedPromise = forSeek ? fetchPromise : Promise.race([
+      fetchPromise,
+      new Promise<FetchResult>((_, reject) => {
+        setTimeout(() => {
+          reject(new Error(`Segment fetch timeout for ${segmentKey} after ${fetchTimeout}ms`));
+        }, fetchTimeout);
+      })
+    ]);
 
-    const racedPromise = Promise.race([fetchPromise, timeoutPromise]);
     this.activeFetches.set(segmentKey, racedPromise);
 
     try {
       const result = await racedPromise;
-      console.log(`[IntegratedFetch] Fetch completed for ${segmentKey}, success: ${result.success}`);
       return result;
     } catch (error) {
       console.error(`[IntegratedFetch] Error fetching ${segmentKey}:`, error);
@@ -158,7 +162,6 @@ export class IntegratedSegmentFetchClient {
       };
     } finally {
       this.activeFetches.delete(segmentKey);
-      console.log(`[IntegratedFetch] Removed ${segmentKey} from active fetches (remaining: ${this.activeFetches.size})`);
     }
   }
 
@@ -236,21 +239,26 @@ export class IntegratedSegmentFetchClient {
       };
     }
 
-    // Step 3: Normal mode - Query signaling server for peers
+    // Step 3: Query signaling for peers with segment (skip for critical)
     let peerIds: string[] = [];
-    try {
-      const whoHasResponse = await this.queryWhoHasSegment(segment);
-      // Extract peerIds from response (peers is now array of objects with peerId and metrics)
-      peerIds = whoHasResponse.peers.map(p => p.peerId);
-      console.log(`[IntegratedFetch] WhoHas response: ${peerIds.length} peers have ${segmentKey}`);
-    } catch (error) {
-      console.warn(`[IntegratedFetch] WhoHas query failed for ${segmentKey}:`, 
-        error instanceof Error ? error.message : error);
-      // Continue to HTTP fallback
+    if (!critical) {
+      try {
+        const whoHasResponse = await this.queryWhoHasSegment(segment);
+        // Extract peerIds from response (peers is now array of objects with peerId and metrics)
+        peerIds = whoHasResponse.peers.map(p => p.peerId);
+        console.log(`[IntegratedFetch] WhoHas response: ${peerIds.length} peers have ${segmentKey}`);
+      } catch (error) {
+        console.warn(`[IntegratedFetch] WhoHas query failed for ${segmentKey}:`, 
+          error instanceof Error ? error.message : error);
+        // Continue to HTTP fallback
+      }
+    } else {
+      console.log(`[IntegratedFetch] CRITICAL mode - skipping WhoHas query for ${segmentKey}`);
     }
 
-    // Step 4: Try P2P fetch if peers available
-    if (peerIds.length > 0) {
+    // Step 4: Try P2P fetch if peers available (but skip for critical segments)
+    // Critical segments should use HTTP directly to avoid peer timeout delays
+    if (peerIds.length > 0 && !critical) {
       try {
         const p2pResult = await this.fetchFromPeers(segment, peerIds);
 
@@ -447,7 +455,7 @@ export class IntegratedSegmentFetchClient {
           latency: 0,
           error: new Error('P2P fetch timeout'),
         });
-      }, 3000); // 3 second timeout for P2P attempts
+      }, 3000); // 3 second timeout for P2P attempts - fast fallback to HTTP
     });
 
     try {
@@ -499,10 +507,6 @@ export class IntegratedSegmentFetchClient {
   private cacheSegment(segment: SegmentMetadata, data: ArrayBuffer): void {
     // TTL configured in CacheManager constructor
     this.cacheManager.setSegment(this.movieId, segment.qualityId, segment.id, data);
-
-    console.log(
-      `[IntegratedFetch] Cached segment ${this.getSegmentKey(segment)} (${(data.byteLength / 1024).toFixed(1)} KB)`
-    );
   }
 
   /**

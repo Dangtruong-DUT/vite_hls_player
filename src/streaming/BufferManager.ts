@@ -260,8 +260,9 @@ export class BufferManager {
       // Mark as fetching
       this.fetchingSegments.add(segmentKey);
       
-      // Fetch với critical flag = true → IntegratedFetchClient sẽ fallback HTTP ngay
-      console.log(`[BufferManager] Fetching CRITICAL segment ${segment.id}`);
+      // For initial critical segments, skip P2P entirely and use HTTP directly
+      // This avoids timeout issues when peers aren't ready yet
+      console.log(`[BufferManager] Fetching CRITICAL segment ${segment.id} via HTTP (skipping P2P)`);
       this.emit('segmentNeeded', segment, true);
       
       // Add to parallel fetch promises
@@ -282,10 +283,9 @@ export class BufferManager {
       );
     }
 
-    // Wait for all critical fetches to complete
-    await Promise.all(fetchPromises);
+    // Wait for all critical fetches to complete (with Promise.allSettled to not fail if one fails)
+    await Promise.allSettled(fetchPromises);
     this.isFetchingCritical = false;
-    console.log(`[BufferManager] Completed fetching ${fetchPromises.length} CRITICAL segments`);
   }
 
   /**

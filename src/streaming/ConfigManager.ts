@@ -34,8 +34,8 @@ export const DEFAULT_CONFIG: StreamingConfig = {
 
   // Fetch settings
   maxConcurrentFetches: 6, // 6 concurrent fetches (expanded from 4)
-  fetchTimeout: 5000, // 5s - reduced from 8s for faster fallback
-  maxRetries: 2, // Reduced from 3 to 2 for faster fallback
+  fetchTimeout: 10000, // 10s - increased for better HTTP reliability
+  maxRetries: 1, // Reduced to 1 - IntegratedFetchClient handles fallback strategy
   retryDelayBase: 300, // 300ms, reduced from 500ms
   staggeredRequestDelay: 100, // 100ms between peer requests
   segmentRequestWaitMin: 50, // Minimum 50ms wait before sending segment request
