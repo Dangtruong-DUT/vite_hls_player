@@ -68,6 +68,9 @@ export class IntegratedSegmentFetchClient {
 
   // Active fetch tracking
   private activeFetches = new Map<string, Promise<FetchResult>>();
+  
+  // Track segments fetched as critical to skip P2P queries for them
+  private criticalFetchedSegments = new Set<string>();
 
   constructor(
     movieId: string,
@@ -91,7 +94,7 @@ export class IntegratedSegmentFetchClient {
    * Main entry point: Fetch segment with full P2P + HTTP fallback logic
    */
   async fetchSegment(request: SegmentFetchRequest): Promise<FetchResult> {
-    const { segment, forSeek } = request;
+    const { segment, forSeek, critical } = request;
     const segmentKey = this.getSegmentKey(segment);
 
     // Check if already appended - if so, skip entirely to avoid re-fetch loop
@@ -118,7 +121,6 @@ export class IntegratedSegmentFetchClient {
     // Check if already fetching
     if (this.activeFetches.has(segmentKey)) {
       const existingPromise = this.activeFetches.get(segmentKey)!;
-      console.log(`[IntegratedFetch] Segment ${segmentKey} already being fetched, waiting for existing promise...`);
       
       try {
         return await existingPromise;
@@ -134,11 +136,13 @@ export class IntegratedSegmentFetchClient {
     const config = this.configManager.getConfig();
     const fetchTimeout = config.fetchTimeout; // Use configured fetchTimeout
     
-    const fetchPromise = this.executeSegmentFetch(segment, forSeek);
+    // Use critical flag or forSeek flag to determine if this is a critical fetch
+    const isCritical = critical || forSeek;
+    const fetchPromise = this.executeSegmentFetch(segment, isCritical);
     
     // For critical segments, skip timeout to ensure HTTP completes
     // Critical segments are needed immediately for playback
-    const racedPromise = forSeek ? fetchPromise : Promise.race([
+    const racedPromise = isCritical ? fetchPromise : Promise.race([
       fetchPromise,
       new Promise<FetchResult>((_, reject) => {
         setTimeout(() => {
@@ -185,7 +189,6 @@ export class IntegratedSegmentFetchClient {
     );
 
     if (cached) {
-      console.log(`[IntegratedFetch] ✓ Cache hit for ${segmentKey}`);
       this.stats.cacheFetches++;
 
       // Queue for append
@@ -199,23 +202,27 @@ export class IntegratedSegmentFetchClient {
       };
     }
 
-    // Step 2: If CRITICAL, skip P2P and fetch directly from Seeder
+    // Step 2: If CRITICAL, skip P2P query and fetch directly from Seeder
     if (critical) {
-      console.log(`[IntegratedFetch] CRITICAL mode - fetching ${segmentKey} directly from Seeder (skipping P2P)`);
+      console.log(`[IntegratedFetch] CRITICAL mode - fetching ${segmentKey} directly from Seeder (skipping P2P query)`);
+      
+      // Mark this segment as fetched critical so future fetches skip P2P queries
+      this.criticalFetchedSegments.add(segmentKey);
       
       try {
         const httpResult = await this.fetchFromSeeder(segment);
 
         if (httpResult.success && httpResult.data) {
-          console.log(`[IntegratedFetch] ✓ CRITICAL HTTP success for ${segmentKey}`);
           this.stats.httpFetches++;
           this.updateHttpLatency(httpResult.latency);
 
           // Cache the segment
           this.cacheSegment(segment, httpResult.data);
 
-          // Report success to signaling with source='server' (notify that we fetched from HTTP/Seeder)
+          // IMPORTANT: Still report to signaling server for P2P network sharing
+          // This allows other peers to know we have this segment
           this.reportSegmentToSignaling(segment, 'server');
+          console.log(`[IntegratedFetch] ✓ CRITICAL segment ${segmentKey} fetched from Seeder and reported to signaling`);
 
           // Queue for append
           await this.queueSegmentForAppend(segment, httpResult.data, httpResult.source);
@@ -239,26 +246,27 @@ export class IntegratedSegmentFetchClient {
       };
     }
 
-    // Step 3: Query signaling for peers with segment (skip for critical)
+    // Step 3: Query signaling for peers with segment 
+    // Skip if this segment was previously fetched as critical
     let peerIds: string[] = [];
-    if (!critical) {
+    if (!this.criticalFetchedSegments.has(segmentKey)) {
+      console.log(`[IntegratedFetch] Querying WhoHas for ${segmentKey}...`);
       try {
         const whoHasResponse = await this.queryWhoHasSegment(segment);
         // Extract peerIds from response (peers is now array of objects with peerId and metrics)
         peerIds = whoHasResponse.peers.map(p => p.peerId);
-        console.log(`[IntegratedFetch] WhoHas response: ${peerIds.length} peers have ${segmentKey}`);
+        console.log(`[IntegratedFetch] WhoHas response for ${segmentKey}: ${peerIds.length} peers found`, peerIds);
       } catch (error) {
         console.warn(`[IntegratedFetch] WhoHas query failed for ${segmentKey}:`, 
           error instanceof Error ? error.message : error);
         // Continue to HTTP fallback
       }
     } else {
-      console.log(`[IntegratedFetch] CRITICAL mode - skipping WhoHas query for ${segmentKey}`);
+      console.log(`[IntegratedFetch] Skipping P2P query for ${segmentKey} (previously fetched as critical)`);
     }
 
-    // Step 4: Try P2P fetch if peers available (but skip for critical segments)
-    // Critical segments should use HTTP directly to avoid peer timeout delays
-    if (peerIds.length > 0 && !critical) {
+    // Step 4: Try P2P fetch if peers available
+    if (peerIds.length > 0) {
       try {
         const p2pResult = await this.fetchFromPeers(segment, peerIds);
 
@@ -292,7 +300,6 @@ export class IntegratedSegmentFetchClient {
       const httpResult = await this.fetchFromSeeder(segment);
 
       if (httpResult.success && httpResult.data) {
-        console.log(`[IntegratedFetch] ✓ HTTP success for ${segmentKey}`);
         this.stats.httpFetches++;
         this.updateHttpLatency(httpResult.latency);
 
@@ -355,8 +362,8 @@ export class IntegratedSegmentFetchClient {
         try {
           const peer = await this.peerManager.connectToPeer(peerId);
           
-          // Wait for connection to be established (with shorter timeout - 1.5s instead of 3s)
-          await this.waitForPeerConnection(peer, 1500);
+          // Wait for connection to be established (3s timeout for connection)
+          await this.waitForPeerConnection(peer, 3000);
           
           // Update peer's available segments
           this.peerManager.updatePeerSegmentAvailability(peerId, [segmentKey]);
@@ -372,7 +379,7 @@ export class IntegratedSegmentFetchClient {
       // Use Promise.race to wait for first connection or timeout
       // This prevents blocking when all peers fail
       const raceTimeout = new Promise<string | null>((resolve) => {
-        setTimeout(() => resolve(null), 2000); // 2s timeout for all connection attempts
+        setTimeout(() => resolve(null), 3500); // 3.5s timeout for all connection attempts
       });
 
       const firstConnected = await Promise.race([
@@ -385,13 +392,7 @@ export class IntegratedSegmentFetchClient {
       ]);
 
       // Check results in background but don't block
-      Promise.allSettled(connectionPromises).then((results) => {
-        const connectedCount = results.filter(
-          (result): result is PromiseFulfilledResult<string> => 
-            result.status === 'fulfilled' && result.value !== null
-        ).length;
-        console.log(`[IntegratedFetch] Background: ${connectedCount} peer(s) connected for ${segmentKey}`);
-      });
+      Promise.allSettled(connectionPromises);
 
       if (firstConnected === null) {
         console.warn(`[IntegratedFetch] Failed to connect to any peers quickly for ${segmentKey}, falling back to HTTP`);
@@ -402,8 +403,6 @@ export class IntegratedSegmentFetchClient {
           error: new Error('No peers connected within timeout'),
         };
       }
-
-      console.log(`[IntegratedFetch] First peer connected: ${firstConnected} for ${segmentKey}`);
 
       // Re-get scored peers after connections
       scoredPeers = this.peerManager.getBestPeersForSegment(
@@ -420,16 +419,11 @@ export class IntegratedSegmentFetchClient {
           error: new Error('No connected peers available'),
         };
       }
-
-      console.log(`[IntegratedFetch] Found ${scoredPeers.length} ready peer(s) for ${segmentKey}`);
     }
 
     // Staggered requests to top peers with timeout
     const topPeers = scoredPeers.slice(0, Math.min(3, scoredPeers.length));
     const fetchPromises: Promise<FetchResult>[] = [];
-
-    console.log(`[IntegratedFetch] Requesting ${segmentKey} from ${topPeers.length} peer(s):`, 
-      topPeers.map(p => p.peerId));
 
     for (let i = 0; i < topPeers.length; i++) {
       const peer = topPeers[i];
@@ -524,7 +518,6 @@ export class IntegratedSegmentFetchClient {
         undefined,         // latency (optional)
         undefined          // speed (optional)
       );
-      console.log(`[IntegratedFetch] Reported segment ${segment.qualityId}:${segment.id} to signaling (source: ${source})`);
     } catch (error) {
       console.warn(`[IntegratedFetch] Failed to report segment to signaling:`, error);
     }
@@ -828,7 +821,7 @@ export class IntegratedSegmentFetchClient {
       if (peer.connectionState === 'failed' || peer.connectionState === 'disconnected') {
         throw new Error(`Peer ${peer.peerId} connection failed`);
       }
-      await this.sleep(50); // Check every 50ms
+      await this.sleep(100); // Check every 100ms
     }
     
     throw new Error(`Peer ${peer.peerId} connection timeout after ${timeout}ms`);

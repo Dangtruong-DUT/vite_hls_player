@@ -198,8 +198,6 @@ export class StreamingPlayerCoordinator {
     });
 
     this.signalingClient.on('whoHasReply', (message) => {
-      console.log(`[Coordinator] WhoHas reply for ${message.segmentId}:`, message.peers);
-      
       // Update peer availability information
       if (message.peers && message.peers.length > 0) {
         message.peers.forEach(peer => {
@@ -209,7 +207,6 @@ export class StreamingPlayerCoordinator {
     });
 
     this.signalingClient.on('peerList', (message) => {
-      console.log(`[Coordinator] Received peer list:`, message.peers);
       // Handle initial peer list from server
     });
 
@@ -252,7 +249,6 @@ export class StreamingPlayerCoordinator {
 
       // Connect to signaling server
       await this.signalingClient.connect();
-      console.log(`[Coordinator] Connected to signaling server`);
 
       // Fetch master playlist
       const masterPlaylist = await this.segmentFetcher.fetchMasterPlaylist();
@@ -334,7 +330,6 @@ export class StreamingPlayerCoordinator {
 
     // Note: reportSegmentAvailability has been replaced with individual reportSegment calls
     // Segments are reported as they are fetched via signalingClient.reportSegmentFetch()
-    console.log(`[Coordinator] ${segments.length} segments available (reported individually on fetch)`);
   }
 
   /**

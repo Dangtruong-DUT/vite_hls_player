@@ -607,8 +607,8 @@ export class PeerManager {
     if (!peer || !isConnected) {
       try {
         peer = await this.connectToPeer(peerId);
-        // Wait for connection to establish with shorter timeout (2s instead of 10s)
-        await this.waitForConnection(peer, Math.min(2000, config.peerConnectionTimeout));
+        // Wait for connection to establish with adequate timeout
+        await this.waitForConnection(peer, Math.min(3000, config.peerConnectionTimeout));
       } catch (error) {
         console.error(`[PeerManager] Failed to connect to peer ${peerId}:`, error);
         // Return error instead of falling back to HTTP
@@ -691,8 +691,8 @@ export class PeerManager {
         };
       }
 
-      // Wait for response with 3s timeout for fast fallback to HTTP
-      const segmentTimeout = Math.min(3000, config.fetchTimeout);
+      // Wait for response with 10s timeout for large segment data transfer
+      const segmentTimeout = Math.min(10000, config.fetchTimeout);
       const data = await this.waitForSegmentData(requestId, peer, segmentTimeout);
 
       // Update metrics - success

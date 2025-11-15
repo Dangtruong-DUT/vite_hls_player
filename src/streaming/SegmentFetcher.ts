@@ -45,7 +45,6 @@ export class SegmentFetcher {
     // Check cache first
     const cached = this.cacheManager.getMasterPlaylist(this.movieId);
     if (cached) {
-      console.log('[SegmentFetcher] Master playlist from cache');
       return cached;
     }
 
@@ -74,7 +73,6 @@ export class SegmentFetcher {
     // Check cache first
     const cached = this.cacheManager.getVariantPlaylist(this.movieId, qualityId);
     if (cached) {
-      console.log(`[SegmentFetcher] Variant playlist ${qualityId} from cache`);
       return cached;
     }
 
@@ -103,7 +101,6 @@ export class SegmentFetcher {
     // Check cache first
     const cached = this.cacheManager.getInitSegment(this.movieId, qualityId);
     if (cached) {
-      console.log(`[SegmentFetcher] Init segment ${qualityId} from cache`);
       return cached;
     }
 
