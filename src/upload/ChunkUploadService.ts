@@ -80,7 +80,7 @@ export class ChunkUploadService {
         console.log(`Chunk size: ${this.formatFileSize(this.CHUNK_SIZE)}`);
         console.log(`Total chunks: ${this.totalChunks}`);
 
-        const response = await this.api.post('/api/movies/chunk-upload/initiate', requestPayload);
+        const response = await this.api.post('/api/v1/movies/chunk-upload/initiate', requestPayload);
         this.uploadId = response.data.data.uploadId;
 
         console.log(`Upload session: ${this.uploadId}`);
@@ -119,7 +119,7 @@ export class ChunkUploadService {
         if (!this.uploadId) {
             throw new Error('Upload not initiated.');
         }
-        const response = await this.api.get(`/api/movies/chunk-upload/${this.uploadId}/status`);
+        const response = await this.api.get(`/api/v1/movies/chunk-upload/${this.uploadId}/status`);
         return response.data.data;
     }
 
@@ -127,17 +127,17 @@ export class ChunkUploadService {
         if (!this.uploadId) {
             throw new Error('Upload not initiated.');
         }
-        const response = await this.api.post(`/api/movies/chunk-upload/${this.uploadId}/complete`);
+        const response = await this.api.post(`/api/v1/movies/chunk-upload/${this.uploadId}/complete`);
         return response.data.data;
     }
 
     async checkMovieStatus(movieId: string): Promise<MovieStatus> {
-        const response = await this.api.get(`/api/movies/${movieId}/status`);
+        const response = await this.api.get(`/api/v1/movies/${movieId}/status`);
         return response.data.data;
     }
 
     async getMovieInfo(movieId: string): Promise<MovieInfo> {
-        const response = await this.api.get(`/api/movies/${movieId}`);
+        const response = await this.api.get(`/api/v1/movies/${movieId}`);
         return response.data.data;
     }
 
@@ -206,7 +206,7 @@ export class ChunkUploadService {
         if (!this.uploadId) {
             return;
         }
-        await this.api.delete(`/api/movies/chunk-upload/${this.uploadId}`);
+        await this.api.delete(`/api/v1/movies/chunk-upload/${this.uploadId}`);
         this.uploadId = null;
     }
 
@@ -243,7 +243,7 @@ export class ChunkUploadService {
         formData.append('data', metadataBlob);
 
         await this.api.post(
-            `/api/movies/chunk-upload/${this.uploadId}/chunks/${chunkNumber}`,
+            `/api/v1/movies/chunk-upload/${this.uploadId}/chunks/${chunkNumber}`,
             formData
             // Note: Don't set Content-Type header manually, let browser handle multipart boundaries
         );

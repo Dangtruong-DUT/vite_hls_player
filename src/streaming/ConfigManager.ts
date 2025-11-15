@@ -51,7 +51,7 @@ export const DEFAULT_CONFIG: StreamingConfig = {
   seekPrefetchBehind: 5, // Prefetch 5 segments behind on seek (expanded from 2)
 
   // API endpoints
-  baseUrl: import.meta.env.VITE_BASE_URL || 'http://localhost:8080/api',
+  baseUrl: import.meta.env.VITE_BASE_URL || 'http://localhost:8080/api/v1',
 };
 
 export class ConfigManager {

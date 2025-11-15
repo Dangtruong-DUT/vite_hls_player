@@ -64,10 +64,10 @@ export class CacheManager {
 
   // Seeder endpoints
   private seederEndpoints: SeederEndpoints = {
-    masterPlaylist: (movieId) => `/api/streams/movies/${movieId}/master.m3u8`,
-    variantPlaylist: (movieId, qualityId) => `/api/streams/movies/${movieId}/${qualityId}/playlist.m3u8`,
-    initSegment: (movieId, qualityId) => `/api/streams/movies/${movieId}/${qualityId}/init.mp4`,
-    mediaSegment: (movieId, qualityId, segmentId) => `/api/streams/movies/${movieId}/${qualityId}/${segmentId}`,
+    masterPlaylist: (movieId) => `/api/v1/streams/movies/${movieId}/master.m3u8`,
+    variantPlaylist: (movieId, qualityId) => `/api/v1/streams/movies/${movieId}/${qualityId}/playlist.m3u8`,
+    initSegment: (movieId, qualityId) => `/api/v1/streams/movies/${movieId}/${qualityId}/init.mp4`,
+    mediaSegment: (movieId, qualityId, segmentId) => `/api/v1/streams/movies/${movieId}/${qualityId}/${segmentId}`,
   };
 
   constructor(config?: Partial<CacheConfig>) {

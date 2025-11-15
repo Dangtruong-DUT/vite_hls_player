@@ -63,7 +63,7 @@ export class SignalingClient {
     clientId: string,
     movieId: string,
     configManager: ConfigManager,
-    seederEndpoint = '/api/streams/movies'
+    seederEndpoint = '/api/v1/streams/movies'
   ) {
     this.clientId = clientId;
     this.movieId = movieId;
@@ -252,7 +252,7 @@ export class SignalingClient {
    * 
    * @param qualityId - Quality level ID
    * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
-   * @returns Full URL to fetch from seeder (e.g., /api/streams/movies/{movieId}/{qualityId}/seg_0001.m4s)
+   * @returns Full URL to fetch from seeder (e.g., /api/v1/streams/movies/{movieId}/{qualityId}/seg_0001.m4s)
    */
   getSeederUrl(qualityId: string, segmentId: string): string {
     return `${this.seederEndpoint}/${this.movieId}/${qualityId}/${segmentId}`;
