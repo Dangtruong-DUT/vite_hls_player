@@ -16,6 +16,7 @@ import { CacheManager } from './CacheManager';
 import { SegmentFetcher } from './SegmentFetcher';
 import { ConfigManager } from './ConfigManager';
 import { MseManager } from './MseManager';
+import type { IFetchStrategy } from './interfaces/IFetchStrategy';
 
 export interface SegmentFetchRequest {
   segment: SegmentMetadata;
@@ -37,7 +38,7 @@ export interface SegmentFetchStats {
 /**
  * Integrated segment fetch coordinator with P2P + HTTP fallback
  */
-export class IntegratedSegmentFetchClient {
+export class IntegratedSegmentFetchClient implements IFetchStrategy {
   private movieId: string;
   private signalingClient: SignalingClient;
   private peerManager: PeerManager;
@@ -88,6 +89,19 @@ export class IntegratedSegmentFetchClient {
     this.segmentFetcher = segmentFetcher;
     this.mseManager = mseManager;
     this.configManager = configManager;
+  }
+
+  /**
+   * Fetch segment (IFetchStrategy interface)
+   */
+  async fetch(segment: SegmentMetadata): Promise<ArrayBuffer | null> {
+    const result = await this.fetchSegment({
+      segment,
+      priority: 1,
+      forSeek: false,
+      critical: false,
+    });
+    return result.success ? result.data : null;
   }
 
   /**
@@ -830,7 +844,7 @@ export class IntegratedSegmentFetchClient {
   /**
    * Cleanup
    */
-  dispose(): void {
+  destroy(): void {
     this.appendQueue = [];
     this.appendedSegments.clear();
     this.activeFetches.clear();

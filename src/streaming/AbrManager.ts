@@ -23,6 +23,8 @@ import { PeerManager } from './PeerManager';
 import { SignalingClient } from './SignalingClient';
 import { CacheManager } from './CacheManager';
 import { ConfigManager } from './ConfigManager';
+import { EventEmitter } from './interfaces/IEventEmitter';
+import type { IBandwidthEstimationStrategy, IQualitySelectionStrategy } from './interfaces/IAbrManager';
 
 export interface AbrManagerEvents {
   qualityChanged: (oldQuality: Quality | null, newQuality: Quality, reason: string) => void;
@@ -30,9 +32,10 @@ export interface AbrManagerEvents {
   bandwidthEstimated: (bandwidth: number) => void;
   segmentFetched: (segmentId: string, qualityId: string, source: string) => void;
   prefetchComplete: (count: number, qualityId: string) => void;
+  [key: string]: (...args: any[]) => void;
 }
 
-export class AbrManager {
+export class AbrManager extends EventEmitter<AbrManagerEvents> {
   private configManager: ConfigManager;
   private peerManager: PeerManager;
   private signalingClient: SignalingClient;
@@ -53,7 +56,9 @@ export class AbrManager {
   // Prefetch state
   private prefetchedSegments = new Set<string>(); // Set of "qualityId:segmentId"
   
-  private eventListeners: Partial<AbrManagerEvents> = {};
+  // Strategy pattern support
+  private bandwidthStrategy: IBandwidthEstimationStrategy | null = null;
+  private qualityStrategy: IQualitySelectionStrategy | null = null;
 
   constructor(
     movieId: string,
@@ -62,6 +67,7 @@ export class AbrManager {
     cacheManager: CacheManager,
     configManager: ConfigManager,
   ) {
+    super();
     this.movieId = movieId;
     this.peerManager = peerManager;
     this.signalingClient = signalingClient;
@@ -97,7 +103,13 @@ export class AbrManager {
   /**
    * Load variant playlist for a specific quality
    */
-  private async loadVariantPlaylist(qualityId: string): Promise<void> {
+  async loadVariantPlaylist(qualityId: string): Promise<VariantPlaylist> {
+    // Check if already loaded
+    const existing = this.variantPlaylists.get(qualityId);
+    if (existing) {
+      return existing;
+    }
+
     try {
       const url = this.configManager.getSeederUrl(this.movieId, qualityId, 'playlist.m3u8');
       const response = await fetch(url);
@@ -112,6 +124,7 @@ export class AbrManager {
       this.variantPlaylists.set(qualityId, playlist);
       
       console.log(`[AbrManager] Loaded playlist for ${qualityId}: ${playlist.segments.length} segments`);
+      return playlist;
     } catch (error) {
       console.error(`[AbrManager] Failed to load playlist for ${qualityId}:`, error);
       throw error;
@@ -499,13 +512,26 @@ export class AbrManager {
 
   /**
    * Estimate best quality based on bandwidth and buffer status
-   * Implements ABR algorithm
+   * Implements ABR algorithm with Strategy Pattern support
    */
   selectQuality(bufferStatus: BufferStatus): Quality | null {
     if (!this.masterPlaylist || this.masterPlaylist.qualities.length === 0) {
       return null;
     }
 
+    // Use strategy if available
+    if (this.qualityStrategy) {
+      const qualities = this.masterPlaylist.qualities;
+      const selected = this.qualityStrategy.selectQuality(
+        qualities,
+        this.currentQuality,
+        this.estimatedBandwidth,
+        bufferStatus
+      );
+      return selected;
+    }
+
+    // Fallback to existing ABR logic
     const config = this.configManager.getConfig();
     
     // Don't switch if already switching
@@ -621,35 +647,63 @@ export class AbrManager {
   }
 
   /**
-   * Event subscription
+   * Set bandwidth estimation strategy (IBandwidthEstimator interface)
    */
-  on<K extends keyof AbrManagerEvents>(event: K, listener: AbrManagerEvents[K]): void {
-    this.eventListeners[event] = listener;
+  setBandwidthStrategy(strategy: IBandwidthEstimationStrategy): void {
+    this.bandwidthStrategy = strategy;
+    console.log('[AbrManager] Bandwidth estimation strategy updated');
   }
 
   /**
-   * Emit event
+   * Estimate bandwidth (Strategy Pattern)
    */
-  private emit<K extends keyof AbrManagerEvents>(
-    event: K,
-    ...args: Parameters<NonNullable<AbrManagerEvents[K]>>
-  ): void {
-    const listener = this.eventListeners[event];
-    if (listener) {
-      // @ts-expect-error - TypeScript has trouble with spread args
-      listener(...args);
+  estimateBandwidth(downloadSize: number, downloadTime: number): number {
+    if (this.bandwidthStrategy) {
+      this.bandwidthStrategy.addSample(downloadSize, downloadTime);
+      const bandwidth = this.bandwidthStrategy.getEstimate();
+      this.estimatedBandwidth = bandwidth;
+      this.emit('bandwidthEstimated', bandwidth);
+      return bandwidth;
     }
+    
+    // Fallback to existing implementation
+    const bandwidth = (downloadSize * 8) / (downloadTime / 1000); // bits per second
+    this.bandwidthSamples.push(bandwidth);
+    
+    // Keep only recent samples
+    const maxSamples = 5; // Default value since config.abr doesn't exist yet
+    if (this.bandwidthSamples.length > maxSamples) {
+      this.bandwidthSamples.shift();
+    }
+    
+    // Calculate weighted average (recent samples weighted more)
+    const weights = this.bandwidthSamples.map((_, i) => i + 1);
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    const estimated = this.bandwidthSamples.reduce((sum, bw, i) => sum + (bw * weights[i]), 0) / totalWeight;
+    
+    this.estimatedBandwidth = estimated;
+    this.emit('bandwidthEstimated', estimated);
+    return estimated;
+  }
+
+  /**
+   * Set quality selection strategy (Strategy Pattern)
+   */
+  setQualityStrategy(strategy: IQualitySelectionStrategy): void {
+    this.qualityStrategy = strategy;
+    console.log('[AbrManager] Quality selection strategy updated');
   }
 
   /**
    * Cleanup
    */
-  dispose(): void {
+  destroy(): void {
     console.log('[AbrManager] Disposing ABR manager');
     this.variantPlaylists.clear();
     this.initSegments.clear();
     this.prefetchedSegments.clear();
     this.bandwidthSamples = [];
-    this.eventListeners = {};
+    this.bandwidthStrategy = null;
+    this.qualityStrategy = null;
   }
 }

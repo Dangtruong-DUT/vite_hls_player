@@ -10,6 +10,8 @@ import type {
 } from './types';
 import { MseManager } from './MseManager';
 import { ConfigManager } from './ConfigManager';
+import { EventEmitter } from './interfaces/IEventEmitter';
+import type { IBufferManager, IBufferMonitor, IBufferPrefetcher } from './interfaces/IBufferManager';
 
 export interface BufferManagerEvents {
   bufferLow: (bufferAhead: number) => void;
@@ -33,28 +35,27 @@ export interface SegmentAppendRequest {
 /**
  * Buffer Manager với tích hợp fetch logic và sequential append
  */
-export class BufferManager {
+export class BufferManager extends EventEmitter<BufferManagerEvents> implements IBufferManager {
   private mseManager: MseManager;
   private configManager: ConfigManager;
   private videoElement: HTMLVideoElement;
 
   private currentQuality: Quality | null = null;
   private segments: SegmentMetadata[] = [];
-  
+
   // Sequential append queue - CRITICAL: Đảm bảo không có gap trong timeline
   private appendQueue: SegmentAppendRequest[] = [];
   private isAppending = false;
   private appendedSegments = new Set<string>(); // Set of segmentKey: `${qualityId}:${segmentId}`
   private fetchingSegments = new Set<string>(); // Track segments currently being fetched
   private nextExpectedSegmentIndex: number = 0; // Index của segment tiếp theo cần append
-  
+
   private isBuffering = false;
   private isSeeking = false;
-  
+
   private monitorInterval: number | null = null;
   private lastCriticalFetchTime = 0; // Track last critical fetch to prevent spam (debounce)
   private isFetchingCritical = false; // Prevent concurrent critical fetches
-  private eventListeners: Partial<BufferManagerEvents> = {};
 
   // Fetch callback - Injected from coordinator/integrated fetch client
   private fetchSegmentCallback: ((segment: SegmentMetadata, critical: boolean) => Promise<ArrayBuffer | null>) | null = null;
@@ -64,6 +65,7 @@ export class BufferManager {
     mseManager: MseManager,
     configManager: ConfigManager
   ) {
+    super();
     this.videoElement = videoElement;
     this.mseManager = mseManager;
     this.configManager = configManager;
@@ -123,11 +125,11 @@ export class BufferManager {
    */
   startMonitoring(): void {
     if (this.monitorInterval) return;
-    
+
     // Monitoring interval 1000ms
     this.monitorInterval = window.setInterval(() => {
       this.checkBufferHealth();
-      
+
       // Cleanup every 10 seconds
       if (Date.now() % 10000 < 1000) {
         this.performPeriodicCleanup();
@@ -177,7 +179,7 @@ export class BufferManager {
     // CRITICAL: Buffer quá thấp → cần fetch ngay từ Seeder (HTTP)
     // Sử dụng 1/3 của bufferMinThreshold làm critical threshold
     const criticalThreshold = config.bufferMinThreshold / 3;
-    
+
     if (status.bufferAhead < criticalThreshold) {
       this.emit('bufferCritical', status.bufferAhead);
       console.warn(`[BufferManager] CRITICAL buffer: ${status.bufferAhead.toFixed(2)}s`);
@@ -231,7 +233,7 @@ export class BufferManager {
 
     const currentTime = this.videoElement.currentTime;
     const currentSegment = this.findSegmentAtTime(currentTime);
-    
+
     if (!currentSegment) {
       console.log(`[BufferManager] No segment found at current time ${currentTime.toFixed(2)}s`);
       this.isFetchingCritical = false;
@@ -241,15 +243,15 @@ export class BufferManager {
     // Fetch ngay 3-5 segments tiếp theo với high priority (tăng từ 3 lên 5)
     const criticalCount = 5;
     const startIndex = this.segments.indexOf(currentSegment);
-    
+
     console.log(`[BufferManager] Fetching ${criticalCount} CRITICAL segments from ${currentSegment.id} (index ${startIndex})`);
-    
+
     const fetchPromises: Promise<void>[] = [];
-    
+
     for (let i = 0; i < criticalCount && startIndex + i < this.segments.length; i++) {
       const segment = this.segments[startIndex + i];
       const segmentKey = this.getSegmentKey(segment);
-      
+
       // Skip if already appended or currently being fetched
       if (this.appendedSegments.has(segmentKey)) continue;
       if (this.fetchingSegments.has(segmentKey)) {
@@ -259,12 +261,12 @@ export class BufferManager {
 
       // Mark as fetching
       this.fetchingSegments.add(segmentKey);
-      
+
       // For initial critical segments, skip P2P entirely and use HTTP directly
       // This avoids timeout issues when peers aren't ready yet
       console.log(`[BufferManager] Fetching CRITICAL segment ${segment.id} via HTTP (skipping P2P)`);
       this.emit('segmentNeeded', segment, true);
-      
+
       // Add to parallel fetch promises
       fetchPromises.push(
         this.fetchSegmentCallback(segment, true)
@@ -314,7 +316,7 @@ export class BufferManager {
 
     // Collect segments to fetch
     const segmentsToFetch: SegmentMetadata[] = [];
-    
+
     for (let i = startIndex; i <= endIndex; i++) {
       const segment = this.segments[i];
       if (!segment) continue;
@@ -341,10 +343,10 @@ export class BufferManager {
     for (let i = 0; i < Math.min(segmentsToFetch.length, maxConcurrent); i++) {
       const segment = segmentsToFetch[i];
       const segmentKey = this.getSegmentKey(segment);
-      
+
       // Mark as fetching
       this.fetchingSegments.add(segmentKey);
-      
+
       promises.push((async () => {
         try {
           this.emit('segmentNeeded', segment, false);
@@ -372,27 +374,27 @@ export class BufferManager {
 
     const config = this.configManager.getConfig();
     const seekSegment = this.findSegmentAtTime(seekTime);
-    
+
     if (!seekSegment) {
       console.warn(`[BufferManager] No segment found at seek time ${seekTime}`);
       return;
     }
 
     const seekIndex = this.segments.indexOf(seekSegment);
-    
+
     // Fetch window: 5 segments trước + 10 segments sau seek position
     const windowBefore = 5;
     const windowAfter = 10;
-    
+
     const startIndex = Math.max(0, seekIndex - windowBefore);
     const endIndex = Math.min(this.segments.length - 1, seekIndex + windowAfter);
 
     const segmentsToFetch: Array<{ segment: SegmentMetadata; distance: number }> = [];
-    
+
     for (let i = startIndex; i <= endIndex; i++) {
       const segment = this.segments[i];
       const segmentKey = this.getSegmentKey(segment);
-      
+
       if (this.appendedSegments.has(segmentKey)) continue;
 
       const distance = Math.abs(i - seekIndex);
@@ -404,15 +406,15 @@ export class BufferManager {
 
     // Fetch in parallel (limited concurrency)
     const maxConcurrent = config.maxConcurrentFetches;
-    
+
     for (let i = 0; i < segmentsToFetch.length; i += maxConcurrent) {
       const batch = segmentsToFetch.slice(i, i + maxConcurrent);
-      
+
       await Promise.allSettled(
         batch.map(async ({ segment, distance }) => {
           this.emit('segmentNeeded', segment, distance === 0); // Segment đúng vị trí seek = critical
           const data = await this.fetchSegmentCallback!(segment, distance === 0);
-          
+
           if (data) {
             // Priority cao nhất cho segment tại vị trí seek
             const priority = 100 - distance * 5;
@@ -491,7 +493,7 @@ export class BufferManager {
     while (this.appendQueue.length > 0) {
       // Lấy segment có priority cao nhất NHƯNG phải tuân thủ thứ tự sequential
       const request = this.findNextSequentialSegment();
-      
+
       if (!request) {
         // Không có segment nào phù hợp với sequence → chờ fetch thêm
         const expectedSegment = this.segments[this.nextExpectedSegmentIndex];
@@ -506,17 +508,17 @@ export class BufferManager {
       try {
         // Append to MSE
         await this.mseManager.appendMediaSegment(request.data);
-        
+
         this.appendedSegments.add(segmentKey);
-        
+
         // Update next expected index
         const segmentIndex = this.segments.findIndex(s => s.id === request.segment.id);
         if (segmentIndex !== -1) {
           this.nextExpectedSegmentIndex = segmentIndex + 1;
         }
-        
+
         this.emit('segmentAppended', request.segment.id);
-        
+
         console.log(
           `[BufferManager] Appended segment ${segmentKey} sequentially (next expected index: ${this.nextExpectedSegmentIndex})`
         );
@@ -571,7 +573,7 @@ export class BufferManager {
         const indexB = this.segments.findIndex(s => s.id === b.segment.id);
         return indexA - indexB;
       });
-      
+
       const firstSegment = sortedByIndex[0];
       if (firstSegment) {
         const segmentIndex = this.segments.findIndex(s => s.id === firstSegment.segment.id);
@@ -610,7 +612,7 @@ export class BufferManager {
   private async handleSeeked(): Promise<void> {
     const seekTime = this.videoElement.currentTime;
     console.log('[BufferManager] Seeked to', seekTime);
-    
+
     // Reset sequence từ vị trí seek
     const seekSegment = this.findSegmentAtTime(seekTime);
     if (seekSegment) {
@@ -625,7 +627,7 @@ export class BufferManager {
 
     // Prefetch segments xung quanh vị trí seek
     await this.prefetchSegmentsAroundSeek(seekTime);
-    
+
     // Trigger immediate buffer check sau seek để đảm bảo fetch tiếp tục
     this.checkBufferHealth();
   }
@@ -649,10 +651,10 @@ export class BufferManager {
     if (!this.isBuffering) {
       this.isBuffering = true;
       this.emit('bufferingStart');
-      
+
       const status = this.getBufferStatus();
       console.log(`[BufferManager] Buffering started - buffer ahead: ${status.bufferAhead.toFixed(2)}s`);
-      
+
       // Trigger critical fetch để load segments cần thiết ngay lập tức
       this.prefetchCriticalSegments();
     }
@@ -686,10 +688,10 @@ export class BufferManager {
     for (let i = 0; i < this.segments.length; i++) {
       const segment = this.segments[i];
       const nextSegment = this.segments[i + 1];
-      
+
       const segmentStart = segment.timestamp;
       const segmentEnd = nextSegment ? nextSegment.timestamp : Infinity;
-      
+
       if (time >= segmentStart && time < segmentEnd) {
         return segment;
       }
@@ -703,6 +705,25 @@ export class BufferManager {
     }
 
     return null;
+  }
+
+  /**
+   * Tìm segment tiếp theo sau thời điểm cụ thể
+   * Dùng cho quality switch để tìm segment tiếp theo cần fetch
+   */
+  private findNextSegmentAfterTime(time: number): SegmentMetadata | null {
+    if (this.segments.length === 0) return null;
+
+    for (let i = 0; i < this.segments.length; i++) {
+      const segment = this.segments[i];
+      // Tìm segment đầu tiên có timestamp > currentTime
+      if (segment.timestamp > time) {
+        return segment;
+      }
+    }
+
+    // Nếu không tìm thấy, trả về segment cuối (EOF)
+    return this.segments[this.segments.length - 1] || null;
   }
 
   /**
@@ -769,6 +790,7 @@ export class BufferManager {
 
   /**
    * Switch quality (ABR) - Fetch init segment + segments mới
+   * Giữ nguyên timeline, chỉ xóa prefetch segments và fetch segment tiếp theo ở quality mới
    */
   async switchQuality(
     newQuality: Quality,
@@ -783,7 +805,7 @@ export class BufferManager {
 
     this.emit('qualitySwitch', oldQualityId, newQuality.id);
 
-    // Clear append queue
+    // Clear append queue - xóa các segment đang chờ append
     this.appendQueue = [];
 
     // Update quality và segments
@@ -791,7 +813,9 @@ export class BufferManager {
     this.segments = newSegments;
 
     // Append init segment của quality mới (bỏ qua nếu đã append bởi MSE manager)
-    if (!skipInitAppend) {
+    if (skipInitAppend) {
+      console.log('[BufferManager] Skipping init append because MSE already appended it');
+    } else {
       try {
         const initSegmentObj = {
           qualityId: newQuality.id,
@@ -805,44 +829,62 @@ export class BufferManager {
         console.error('[BufferManager] Failed to append init segment:', error);
         return;
       }
-    } else {
-      console.log('[BufferManager] Skipping init append because MSE already appended it');
     }
 
-    // Reset tracking (segments của quality mới chưa append)
-    this.appendedSegments.clear();
-    
-    // Tìm segment tại vị trí hiện tại trong quality mới
+    // Cập nhật appendedSegments: xóa các segment của quality cũ sau currentTime
+    // Giữ lại các segment đã append trước currentTime để tránh gap
     const currentTime = this.videoElement.currentTime;
-    const currentSegment = this.findSegmentAtTime(currentTime);
-    
-    if (currentSegment) {
-      const currentIndex = this.segments.indexOf(currentSegment);
-      if (currentIndex !== -1) {
-        this.nextExpectedSegmentIndex = currentIndex;
-        await this.prefetchSegmentsForQualitySwitch(currentIndex);
+    const segmentsToRemove: string[] = [];
+
+    for (const segmentKey of this.appendedSegments) {
+      const [qualityId] = segmentKey.split(':');
+      if (qualityId === oldQualityId) {
+        // Tìm segment trong old quality segments để check time
+        const segment = this.segments.find(s => this.getSegmentKey(s) === segmentKey);
+        // Xóa nếu segment sau currentTime (đã bị remove khỏi buffer)
+        if (!segment || (segment.startTime && segment.startTime >= currentTime)) {
+          segmentsToRemove.push(segmentKey);
+        }
       }
+    }
+
+    for (const key of segmentsToRemove) {
+      this.appendedSegments.delete(key);
+    }
+    console.log(`[BufferManager] Removed ${segmentsToRemove.length} old quality segments from tracking`);
+
+    // Tìm segment tiếp theo tại vị trí currentTime trong quality mới
+    const nextSegment = this.findNextSegmentAfterTime(currentTime);
+
+    if (nextSegment) {
+      const nextIndex = this.segments.indexOf(nextSegment);
+      if (nextIndex !== -1) {
+        this.nextExpectedSegmentIndex = nextIndex;
+        console.log(`[BufferManager] Next segment after quality switch: #${nextIndex} (${nextSegment.id})`);
+        await this.prefetchSegmentsForQualitySwitch(nextIndex);
+      }
+    } else {
+      console.warn('[BufferManager] No next segment found after quality switch');
     }
   }
 
   /**
-   * Prefetch the current and next segments immediately after a quality switch.
-   * Ensures the timeline continues without gaps by fetching the segment that
-   * covers the current playback position first, then a couple ahead.
+   * Prefetch segments immediately after a quality switch.
+   * Fetches the next segment at the new quality to continue playback seamlessly.
    */
-  private async prefetchSegmentsForQualitySwitch(currentIndex: number): Promise<void> {
+  private async prefetchSegmentsForQualitySwitch(nextIndex: number): Promise<void> {
     if (!this.fetchSegmentCallback) return;
 
-    const maxAhead = 3; // current segment + next 2 to rebuild buffer quickly
+    const maxAhead = 3; // next segment + 2 more to rebuild buffer quickly
 
     for (let offset = 0; offset < maxAhead; offset++) {
-      const segment = this.segments[currentIndex + offset];
+      const segment = this.segments[nextIndex + offset];
       if (!segment) break;
 
       const segmentKey = this.getSegmentKey(segment);
       if (this.appendedSegments.has(segmentKey)) continue;
 
-      const isCritical = offset === 0;
+      const isCritical = offset === 0; // First segment is critical
       const priority = isCritical ? 120 : 90 - offset * 10;
 
       this.emit('segmentNeeded', segment, isCritical);
@@ -875,7 +917,7 @@ export class BufferManager {
   private cleanupOldAppendedSegments(currentTime: number, config: any): void {
     // Expanded cleanup window to match larger prefetch window
     // Keep extra 120s buffer (2 minutes) for better cache utilization
-    const cleanupBehindTime = currentTime - (config.prefetchWindowBehind + 120); 
+    const cleanupBehindTime = currentTime - (config.prefetchWindowBehind + 120);
     const cleanupAheadTime = currentTime + (config.prefetchWindowAhead + 120);
 
     const segmentsToRemove: string[] = [];
@@ -920,35 +962,20 @@ export class BufferManager {
   }
 
   /**
-   * Event listener registration
+   * Prefetch segments (IBufferPrefetcher interface)
    */
-  on<K extends keyof BufferManagerEvents>(event: K, listener: BufferManagerEvents[K]): void {
-    this.eventListeners[event] = listener;
-  }
-
-  /**
-   * Emit event
-   */
-  private emit<K extends keyof BufferManagerEvents>(
-    event: K,
-    ...args: Parameters<NonNullable<BufferManagerEvents[K]>>
-  ): void {
-    const listener = this.eventListeners[event];
-    if (listener) {
-      // @ts-expect-error - TypeScript has trouble with spread args
-      listener(...args);
-    }
+  prefetch(count: number): void {
+    this.prefetchSegments(count);
   }
 
   /**
    * Cleanup
    */
-  dispose(): void {
+  destroy(): void {
     this.stopMonitoring();
     this.appendQueue = [];
     this.appendedSegments.clear();
     this.segments = [];
-    this.eventListeners = {};
     this.fetchSegmentCallback = null;
     console.log('[BufferManager] Disposed');
   }

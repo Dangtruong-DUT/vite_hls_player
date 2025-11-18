@@ -1,5 +1,6 @@
 /**
  * Cache Manager v2 - Client-Side
+ * Refactored to follow SOLID principles
  * 
  * Features:
  * - Lưu segment, init segment, playlist theo key (streamId, qualityId, segmentId)
@@ -11,13 +12,14 @@
  */
 
 import type { 
-  CacheEntry, 
   CacheStats, 
   InitSegment, 
   MasterPlaylist, 
   VariantPlaylist,
   SegmentMetadata 
 } from './types';
+import type { ICacheManager, ICacheEvictionStrategy, ICacheEntry } from './interfaces/ICacheManager';
+import { LRUEvictionStrategy } from './strategies/CacheEvictionStrategies';
 
 export type CacheableData = ArrayBuffer | InitSegment | MasterPlaylist | VariantPlaylist;
 
@@ -38,10 +40,11 @@ export interface CacheConfig {
 
 /**
  * Cache Manager with hot cache protection and Seeder fallback
+ * Implements ICacheManager interface
  */
-export class CacheManager {
+export class CacheManager implements ICacheManager {
   // Cache storage
-  private cache = new Map<string, CacheEntry<CacheableData>>();
+  private cache = new Map<string, ICacheEntry<CacheableData>>();
   private accessOrder: string[] = []; // LRU tracking
   private hotCache = new Set<string>(); // Protected from eviction
   
@@ -51,6 +54,9 @@ export class CacheManager {
   // Configuration
   private config: CacheConfig;
   private currentSize = 0;
+  
+  // Eviction strategy (Strategy Pattern)
+  private evictionStrategy: ICacheEvictionStrategy;
   
   // Statistics
   private stats: CacheStats = {
@@ -70,7 +76,7 @@ export class CacheManager {
     mediaSegment: (movieId, qualityId, segmentId) => `/api/v1/streams/movies/${movieId}/${qualityId}/${segmentId}`,
   };
 
-  constructor(config?: Partial<CacheConfig>) {
+  constructor(config?: Partial<CacheConfig & { evictionStrategy?: ICacheEvictionStrategy }>) {
     this.config = {
       maxSize: config?.maxSize || 500 * 1024 * 1024, // 500MB default
       segmentTTL: config?.segmentTTL || 30 * 60 * 1000, // 30 minutes
@@ -79,10 +85,32 @@ export class CacheManager {
       hotCacheProtection: config?.hotCacheProtection ?? true,
     };
 
+    // Default to LRU eviction strategy
+    this.evictionStrategy = config?.evictionStrategy || new LRUEvictionStrategy();
+
     this.stats.maxSize = this.config.maxSize;
 
     // Auto cleanup expired entries every 5 minutes
     setInterval(() => this.cleanExpired(), 5 * 60 * 1000);
+  }
+
+  /**
+   * Set eviction strategy (Strategy Pattern - OCP)
+   */
+  setEvictionStrategy(strategy: ICacheEvictionStrategy): void {
+    this.evictionStrategy = strategy;
+  }
+
+  /**
+   * Get time mapper for segment lookup
+   */
+  getTimeMapper() {
+    return {
+      buildTimeMap: this.buildSegmentTimeMap.bind(this),
+      findSegmentAtTime: this.findSegmentAtTime.bind(this),
+      getSegmentsInRange: this.getSegmentsInTimeRange.bind(this),
+      clearTimeMap: this.clearSegmentTimeMap.bind(this),
+    };
   }
 
   // ============ Core Cache Operations ============
@@ -96,7 +124,7 @@ export class CacheManager {
     // Check if we need to evict (skip if hot cache item)
     if (!isHot) {
       while (this.currentSize + size > this.config.maxSize && this.cache.size > 0) {
-        this.evictLRU();
+        this.evict();
       }
     }
 
@@ -108,7 +136,7 @@ export class CacheManager {
     }
 
     // Create cache entry
-    const entry: CacheEntry<CacheableData> = {
+    const entry: ICacheEntry<CacheableData> = {
       key,
       data,
       size,

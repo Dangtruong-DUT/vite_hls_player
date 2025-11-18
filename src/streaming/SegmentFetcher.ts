@@ -14,6 +14,7 @@ import type {
 } from './types';
 import { CacheManager } from './CacheManager';
 import { ConfigManager } from './ConfigManager';
+import type { ISegmentFetcher } from './interfaces/IFetchStrategy';
 
 export interface FetchOptions {
   timeout?: number;
@@ -22,7 +23,7 @@ export interface FetchOptions {
   preferPeer?: boolean;
 }
 
-export class SegmentFetcher {
+export class SegmentFetcher implements ISegmentFetcher {
   private cacheManager: CacheManager;
   private configManager: ConfigManager;
   private movieId: string;

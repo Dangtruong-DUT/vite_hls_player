@@ -23,6 +23,8 @@ import type {
   ErrorMessage
 } from './types';
 import { ConfigManager } from './ConfigManager';
+import { EventEmitter } from './interfaces/IEventEmitter';
+import type { ISignalingClient } from './interfaces/ISignalingClient';
 
 export interface SignalingClientEvents {
   connected: () => void;
@@ -34,14 +36,15 @@ export interface SignalingClientEvents {
   rtcOffer: (data: RtcOfferMessage) => void;
   rtcAnswer: (data: RtcAnswerMessage) => void;
   iceCandidate: (data: IceCandidateMessage) => void;
+  [key: string]: (...args: any[]) => void;
 }
 
-export class SignalingClient {
+export class SignalingClient extends EventEmitter<SignalingClientEvents> implements ISignalingClient {
   private ws: WebSocket | null = null;
   private configManager: ConfigManager;
   private clientId: string;
   private movieId: string; // streamId for WhoHas queries
-  private isConnected = false;
+  private _isConnected = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private pendingRequests = new Map<string, {
@@ -55,7 +58,6 @@ export class SignalingClient {
     response: WhoHasReplyMessage;
     timestamp: number;
   }>();
-  private eventListeners: Partial<SignalingClientEvents> = {};
   private seederEndpoint: string;
   private signalingUrl: string;
 
@@ -65,6 +67,7 @@ export class SignalingClient {
     configManager: ConfigManager,
     seederEndpoint = '/api/v1/streams/movies'
   ) {
+    super();
     this.clientId = clientId;
     this.movieId = movieId;
     this.configManager = configManager;
@@ -86,7 +89,7 @@ export class SignalingClient {
 
         this.ws.onopen = () => {
           console.log('[SignalingClient] Connected to signaling server');
-          this.isConnected = true;
+          this._isConnected = true;
           this.emit('connected');
           this.startHeartbeat();
           resolve();
@@ -103,7 +106,7 @@ export class SignalingClient {
 
         this.ws.onclose = () => {
           console.log('[SignalingClient] Disconnected from signaling server');
-          this.isConnected = false;
+          this._isConnected = false;
           this.emit('disconnected');
           this.stopHeartbeat();
           this.scheduleReconnect();
@@ -111,7 +114,7 @@ export class SignalingClient {
 
         // Connection timeout
         setTimeout(() => {
-          if (!this.isConnected) {
+          if (!this._isConnected) {
             reject(new Error('Signaling connection timeout'));
             this.ws?.close();
           }
@@ -139,7 +142,7 @@ export class SignalingClient {
       this.ws = null;
     }
 
-    this.isConnected = false;
+    this._isConnected = false;
     console.log('[SignalingClient] Manually disconnected');
   }
 
@@ -152,7 +155,7 @@ export class SignalingClient {
    * @returns Promise với list of peers có segment
    */
   async whoHas(qualityId: string, segmentId: string): Promise<WhoHasReplyMessage> {
-    if (!this.isConnected) {
+    if (!this._isConnected) {
       console.warn('[SignalingClient] Not connected, cannot query whoHas');
       throw new Error('Not connected to signaling server');
     }
@@ -225,7 +228,7 @@ export class SignalingClient {
     latency?: number,
     speed?: number
   ): void {
-    if (!this.isConnected) {
+    if (!this._isConnected) {
       console.warn('[SignalingClient] Not connected, cannot report segment');
       return;
     }
@@ -318,7 +321,7 @@ export class SignalingClient {
    * Send message through WebSocket
    * Messages theo Streaming Signaling Protocol đã có type field
    */
-  private send(message: Record<string, unknown>): void {
+  send(message: Record<string, unknown>): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       console.warn('[SignalingClient] Cannot send message, WebSocket not open');
       return;
@@ -438,7 +441,7 @@ export class SignalingClient {
     }
     
     this.heartbeatTimer = setInterval(() => {
-      if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
+      if (this._isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
         this.send({
           type: 'ping', // Use ping type for heartbeat
           clientId: this.clientId,
@@ -486,7 +489,7 @@ export class SignalingClient {
    * Check if connected to signaling server
    */
   isConnectedToServer(): boolean {
-    return this.isConnected && 
+    return this._isConnected && 
            this.ws !== null && 
            this.ws.readyState === WebSocket.OPEN;
   }
@@ -513,30 +516,53 @@ export class SignalingClient {
   }
 
   /**
-   * Event subscription
+   * Check if connected (IConnectionManager interface)
    */
-  on<K extends keyof SignalingClientEvents>(event: K, listener: SignalingClientEvents[K]): void {
-    this.eventListeners[event] = listener;
+  isConnected(): boolean {
+    return this._isConnected && this.ws !== null && this.ws.readyState === WebSocket.OPEN;
   }
 
   /**
-   * Emit event to listeners
+   * Reconnect (IConnectionManager interface)
    */
-  private emit<K extends keyof SignalingClientEvents>(
-    event: K,
-    ...args: Parameters<NonNullable<SignalingClientEvents[K]>>
-  ): void {
-    const listener = this.eventListeners[event];
-    if (listener) {
-      // @ts-expect-error - TypeScript has trouble with spread args
-      listener(...args);
-    }
+  reconnect(): void {
+    this.disconnect();
+    this.connect().catch(err => {
+      console.error('[SignalingClient] Reconnection failed:', err);
+      this.emit('error', err instanceof Error ? err : new Error(String(err)));
+    });
   }
 
   /**
-   * Cleanup and disconnect
+   * Get connection state
    */
-  dispose(): void {
+  getConnectionState(): 'connecting' | 'connected' | 'disconnected' | 'reconnecting' {
+    if (!this.ws) return 'disconnected';
+    if (this._isConnected && this.ws.readyState === WebSocket.OPEN) return 'connected';
+    if (this.ws.readyState === WebSocket.CONNECTING) return 'connecting';
+    if (this.reconnectTimer) return 'reconnecting';
+    return 'disconnected';
+  }
+
+  /**
+   * Get seeder endpoint
+   */
+  getSeederEndpoint(): string {
+    return this.seederEndpoint;
+  }
+
+  /**
+   * Set reconnection strategy (not implemented yet)
+   */
+  setReconnectionStrategy(_strategy: any): void {
+    // TODO: Implement reconnection strategy pattern
+    console.warn('[SignalingClient] setReconnectionStrategy not implemented yet');
+  }
+
+  /**
+   * Dispose - cleanup all resources
+   */
+  destroy(): void {
     console.log('[SignalingClient] Disposing signaling client');
 
     // Reject all pending requests
@@ -547,6 +573,5 @@ export class SignalingClient {
     this.pendingRequests.clear();
 
     this.disconnect();
-    this.eventListeners = {};
   }
 }

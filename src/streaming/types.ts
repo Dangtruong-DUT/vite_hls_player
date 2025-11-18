@@ -58,7 +58,12 @@ export interface PeerInfo {
   connectionState: 'new' | 'connecting' | 'connected' | 'disconnected' | 'failed';
   dataChannel?: RTCDataChannel;
   peerConnection?: RTCPeerConnection;
-  score: number;
+  score: {
+    overall: number;
+    latency: number;
+    uploadSpeed: number;
+    reliability: number;
+  };
   availableSegments: Set<string>; // Set of segmentKey: `${qualityId}:${segmentId}`
   lastActive: number;
   metrics: {

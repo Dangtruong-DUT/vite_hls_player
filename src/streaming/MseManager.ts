@@ -1,5 +1,6 @@
 /**
  * MSE (Media Source Extensions) Manager v2
+ * Refactored to follow SOLID principles
  * Quản lý MediaSource với đầy đủ tính năng:
  * - Append init segment trước khi append media segments
  * - Sequential append từ buffer
@@ -11,6 +12,8 @@
  */
 
 import type { Quality, InitSegment, BufferRange } from './types';
+import type { IMseManager } from './interfaces/IMseManager';
+import { EventEmitter } from './interfaces/IEventEmitter';
 
 export interface MseManagerEvents {
   sourceOpen: () => void;
@@ -24,25 +27,29 @@ export interface MseManagerEvents {
   seekEnd: (targetTime: number) => void;
 }
 
-export class MseManager {
+/**
+ * MseManager implementing IMseManager interface
+ * Extends EventEmitter for event handling
+ */
+export class MseManager extends EventEmitter<MseManagerEvents> implements IMseManager {
   private mediaSource: MediaSource | null = null;
   private sourceBuffer: SourceBuffer | null = null;
   private videoElement: HTMLVideoElement;
-  
+
   private currentQuality: Quality | null = null;
   private initSegment: InitSegment | null = null;
   private totalDuration = 0;
-  
+
   private isInitialized = false;
   private initSegmentAppended = false;
   private pendingSegments: ArrayBuffer[] = [];
   private isAppending = false;
   private objectUrl: string | null = null;
-  
+
   private playbackState: 'playing' | 'paused' | 'buffering' | 'ended' = 'paused';
-  private eventListeners: Partial<MseManagerEvents> = {};
 
   constructor(videoElement: HTMLVideoElement) {
+    super(); // Call EventEmitter constructor
     this.videoElement = videoElement;
     this.setupVideoEventListeners();
   }
@@ -184,6 +191,7 @@ export class MseManager {
 
   /**
    * Append initialization segment (TRƯỚC KHI APPEND MEDIA)
+   * Không thay đổi timestampOffset khi switch quality để giữ nguyên timeline
    */
   async appendInitSegment(initSegment: InitSegment): Promise<void> {
     if (!this.isInitialized || !this.sourceBuffer) {
@@ -195,31 +203,18 @@ export class MseManager {
     this.initSegment = initSegment;
     this.initSegmentAppended = false;
 
-    // Ensure timestampOffset is set so appended media segments line up with current timeline.
-    try {
-      // Compute buffered end: last buffered range end if exists, otherwise currentTime
-      let bufferedEnd = this.videoElement.currentTime;
-      if (this.sourceBuffer.buffered && this.sourceBuffer.buffered.length > 0) {
-        bufferedEnd = this.sourceBuffer.buffered.end(this.sourceBuffer.buffered.length - 1);
-      }
-
-      // Set timestampOffset before appending init so the subsequent media segments align correctly
-      // Some browsers may throw if timestampOffset is set when updating; ensure safe set
-      if (!this.sourceBuffer.updating) {
-        this.sourceBuffer.timestampOffset = bufferedEnd;
-        console.log(`[MseManager] Set sourceBuffer.timestampOffset = ${bufferedEnd.toFixed(2)}s before init append`);
-      } else {
-        // Wait for update end then set
-        await this.waitForUpdateEnd();
-        this.sourceBuffer.timestampOffset = bufferedEnd;
-        console.log(`[MseManager] Set sourceBuffer.timestampOffset = ${bufferedEnd.toFixed(2)}s after waiting for updateend`);
-      }
-    } catch (err) {
-      console.warn('[MseManager] Failed to set timestampOffset before init append:', err);
+    // Wait for any pending updates before appending init
+    if (this.sourceBuffer.updating) {
+      await this.waitForUpdateEnd();
     }
 
+    // KHÔNG thay đổi timestampOffset khi switch quality
+    // Timeline sẽ tiếp tục từ vị trí hiện tại
+    // timestampOffset chỉ được set khi khởi tạo lần đầu hoặc seek
+    console.log(`[MseManager] Current timestampOffset: ${this.sourceBuffer.timestampOffset.toFixed(2)}s`);
+
     await this.appendBuffer(initSegment.data);
-    
+
     this.initSegmentAppended = true;
     console.log(`[MseManager] Init segment appended for quality ${initSegment.qualityId}`);
   }
@@ -299,6 +294,7 @@ export class MseManager {
 
   /**
    * ABR Quality Switch - Append init segment mới
+   * Xóa buffer từ segment tiếp theo (không phải currentTime) để giữ nguyên timeline
    */
   async switchQuality(newQuality: Quality, newInitSegment: InitSegment): Promise<void> {
     if (!this.mediaSource || !this.sourceBuffer) {
@@ -313,15 +309,18 @@ export class MseManager {
     // Clear pending queue
     this.pendingSegments = [];
 
-    // Remove buffered ranges after current time để switch quality
+    // Xóa tất cả buffer sau currentTime để loại bỏ segment prefetch cũ
     const currentTime = this.videoElement.currentTime;
     const buffered = this.getBufferedRanges();
-    
+
     for (const range of buffered) {
-      if (range.end > currentTime + 0.1) { // Small buffer để tránh stutter
+      // Xóa ngay sau currentTime để đảm bảo segment tiếp theo sẽ là chất lượng mới
+      if (range.end > currentTime) {
         try {
-          const removeStart = Math.max(range.start, currentTime + 0.1);
+          // Giữ buffer đến currentTime, xóa tất cả sau đó
+          const removeStart = Math.max(range.start, currentTime);
           await this.removeBuffer(removeStart, range.end);
+          console.log(`[MseManager] Removed buffer from ${removeStart.toFixed(2)}s to ${range.end.toFixed(2)}s`);
         } catch (error) {
           console.warn('[MseManager] Failed to remove buffer during quality switch:', error);
         }
@@ -335,7 +334,7 @@ export class MseManager {
     await this.appendInitSegment(newInitSegment);
 
     this.emit('qualityChanged', newQuality);
-    console.log(`[MseManager] Quality switched to ${newQuality.id}`);
+    console.log(`[MseManager] Quality switched to ${newQuality.id}, buffer cleared after currentTime`);
   }
 
   /**
@@ -458,7 +457,7 @@ export class MseManager {
 
     const duration = this.totalDuration || this.videoElement.duration;
     const targetTime = Math.max(0, Math.min(time, duration));
-    
+
     console.log(`[MseManager] Seeking to ${targetTime.toFixed(2)}s`);
     this.videoElement.currentTime = targetTime;
   }
@@ -597,30 +596,55 @@ export class MseManager {
   }
 
   /**
-   * Event listener registration
+   * Set current quality (IMseManager interface)
    */
-  on<K extends keyof MseManagerEvents>(event: K, listener: MseManagerEvents[K]): void {
-    this.eventListeners[event] = listener;
+  setCurrentQuality(quality: Quality): void {
+    const oldQuality = this.currentQuality;
+    this.currentQuality = quality;
+    if (oldQuality?.id !== quality.id) {
+      this.emit('qualityChanged', quality);
+    }
   }
 
   /**
-   * Emit event
+   * Check if source is open (IMediaSourceController interface)
    */
-  private emit<K extends keyof MseManagerEvents>(
-    event: K,
-    ...args: Parameters<NonNullable<MseManagerEvents[K]>>
-  ): void {
-    const listener = this.eventListeners[event];
-    if (listener) {
-      // @ts-expect-error - TypeScript has trouble with spread args
-      listener(...args);
-    }
+  isSourceOpen(): boolean {
+    return this.mediaSource?.readyState === 'open';
+  }
+
+  /**
+   * Get ready state (IMediaSourceController interface)
+   */
+  getReadyState(): 'closed' | 'open' | 'ended' {
+    return (this.mediaSource?.readyState as 'closed' | 'open' | 'ended') || 'closed';
+  }
+
+  /**
+   * Get playback state (IPlaybackStateManager interface)
+   */
+  getState(): 'playing' | 'paused' | 'buffering' | 'ended' {
+    return this.playbackState;
+  }
+
+  /**
+   * Update state (IPlaybackStateManager interface)
+   */
+  updateState(state: 'playing' | 'paused' | 'buffering' | 'ended'): void {
+    this.updatePlaybackState(state);
+  }
+
+  /**
+   * Check if updating (ISourceBufferManager interface)
+   */
+  isUpdating(): boolean {
+    return this.sourceBuffer?.updating || false;
   }
 
   /**
    * Cleanup và dispose resources
    */
-  dispose(): void {
+  destroy(): void {
     console.log('[MseManager] Disposing');
 
     // Clear queue

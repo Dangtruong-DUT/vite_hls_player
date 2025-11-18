@@ -1,10 +1,20 @@
 /**
  * Streaming Module
  * Barrel export for all streaming player components
+ * Updated to include interfaces and strategies
  */
 
 // Core Types
 export * from './types';
+
+// Interfaces (New - SOLID architecture)
+export * from './interfaces';
+
+// Strategies (New - Strategy Pattern)
+export * from './strategies';
+
+// Utilities (New - Helper classes)
+export { ConfigValidator } from './utils/ConfigValidator';
 
 // Configuration
 export { ConfigManager, DEFAULT_CONFIG, getGlobalConfig, setGlobalConfig } from './ConfigManager';

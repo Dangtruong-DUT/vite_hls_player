@@ -1,9 +1,12 @@
 /**
  * Configuration Manager
  * Centralized configuration for streaming player with default values and validation
+ * Refactored to follow SOLID principles
  */
 
 import type { StreamingConfig } from './types';
+import type { IConfigManager } from './interfaces/IConfigManager';
+import { ConfigValidator } from './utils/ConfigValidator';
 
 export const DEFAULT_CONFIG: StreamingConfig = {
   // Peer settings
@@ -54,13 +57,19 @@ export const DEFAULT_CONFIG: StreamingConfig = {
   baseUrl: import.meta.env.VITE_BASE_URL || 'http://localhost:8080/api/v1',
 };
 
-export class ConfigManager {
+/**
+ * ConfigManager implementing IConfigManager interface
+ * Applies Single Responsibility Principle by delegating validation to ConfigValidator
+ */
+export class ConfigManager implements IConfigManager {
   private config: StreamingConfig;
   private listeners: Set<(config: StreamingConfig) => void> = new Set();
+  private validator: ConfigValidator;
 
   constructor(initialConfig?: Partial<StreamingConfig>) {
+    this.validator = new ConfigValidator();
     this.config = { ...DEFAULT_CONFIG, ...initialConfig };
-    this.validateConfig();
+    this.validator.validate(this.config);
   }
 
   /**
@@ -75,7 +84,7 @@ export class ConfigManager {
    */
   updateConfig(updates: Partial<StreamingConfig>): void {
     this.config = { ...this.config, ...updates };
-    this.validateConfig();
+    this.validator.validate(this.config);
     this.notifyListeners();
   }
 
@@ -91,7 +100,7 @@ export class ConfigManager {
    */
   set<K extends keyof StreamingConfig>(key: K, value: StreamingConfig[K]): void {
     this.config[key] = value;
-    this.validateConfig();
+    this.validator.validate(this.config);
     this.notifyListeners();
   }
 
@@ -109,53 +118,6 @@ export class ConfigManager {
   reset(): void {
     this.config = { ...DEFAULT_CONFIG };
     this.notifyListeners();
-  }
-
-  /**
-   * Validate configuration values
-   */
-  private validateConfig(): void {
-    const c = this.config;
-
-    // Peer validation
-    if (c.maxActivePeers < c.minActivePeers) {
-      throw new Error('maxActivePeers must be >= minActivePeers');
-    }
-    if (c.minActivePeers < 0) {
-      throw new Error('minActivePeers must be >= 0');
-    }
-    if (c.peerScoreThreshold < 0 || c.peerScoreThreshold > 1) {
-      throw new Error('peerScoreThreshold must be between 0 and 1');
-    }
-
-    // Buffer validation
-    if (c.bufferMinThreshold >= c.bufferMaxThreshold) {
-      throw new Error('bufferMinThreshold must be < bufferMaxThreshold');
-    }
-    if (c.prefetchWindowAhead <= 0 || c.prefetchWindowBehind < 0) {
-      throw new Error('prefetchWindow values must be positive');
-    }
-
-    // ABR validation
-    if (c.abrSwitchUpThreshold <= c.abrSwitchDownThreshold) {
-      throw new Error('abrSwitchUpThreshold must be > abrSwitchDownThreshold');
-    }
-    if (c.bandwidthEstimationWindow < 1) {
-      throw new Error('bandwidthEstimationWindow must be >= 1');
-    }
-
-    // Cache validation
-    if (c.cacheSizeLimit <= 0) {
-      throw new Error('cacheSizeLimit must be > 0');
-    }
-
-    // Fetch validation
-    if (c.maxConcurrentFetches < 1) {
-      throw new Error('maxConcurrentFetches must be >= 1');
-    }
-    if (c.maxRetries < 0) {
-      throw new Error('maxRetries must be >= 0');
-    }
   }
 
   /**
@@ -180,7 +142,7 @@ export class ConfigManager {
     try {
       const parsed = JSON.parse(json);
       this.config = { ...DEFAULT_CONFIG, ...parsed };
-      this.validateConfig();
+      this.validator.validate(this.config);
       this.notifyListeners();
     } catch (error) {
       throw new Error(`Failed to parse config JSON: ${error}`);

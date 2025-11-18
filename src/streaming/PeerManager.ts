@@ -16,12 +16,15 @@ import type { PeerInfo, PeerScore, SegmentMetadata, FetchResult } from './types'
 import { SignalingClient } from './SignalingClient';
 import { ConfigManager } from './ConfigManager';
 import { CacheManager } from './CacheManager';
+import { EventEmitter } from './interfaces/IEventEmitter';
+import type { IPeerManager } from './interfaces/IPeerManager';
 
 export interface PeerManagerEvents {
   peerConnected: (peerId: string) => void;
   peerDisconnected: (peerId: string) => void;
   peerScoreUpdated: (peerId: string, score: number) => void;
   fetchFailed: (peerId: string, error: Error) => void;
+  [key: string]: (...args: any[]) => void;
 }
 
 interface PendingSegmentRequest {
@@ -36,7 +39,7 @@ interface PendingSegmentRequest {
   receivedChunks?: number;
 }
 
-export class PeerManager {
+export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPeerManager {
   private configManager: ConfigManager;
   private signalingClient: SignalingClient;
   private cacheManager: CacheManager;
@@ -47,7 +50,6 @@ export class PeerManager {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
   ];
-  private eventListeners: Partial<PeerManagerEvents> = {};
   private requestIdCounter = 0;
   private lastStaggerDelay = 0;
   // Track recent signaling messages to prevent duplicates
@@ -61,6 +63,7 @@ export class PeerManager {
     configManager: ConfigManager,
     cacheManager: CacheManager
   ) {
+    super();
     this.movieId = movieId;
     this.signalingClient = signalingClient;
     this.configManager = configManager;
@@ -124,7 +127,12 @@ export class PeerManager {
       connectionState: 'connecting',
       peerConnection,
       dataChannel,
-      score: 0.5, // Initial neutral score
+      score: {
+        overall: 0.5,
+        latency: 0.5,
+        uploadSpeed: 0.5,
+        reliability: 0.5
+      },
       availableSegments: new Set(),
       lastActive: Date.now(),
       metrics: {
@@ -207,7 +215,12 @@ export class PeerManager {
         peerId,
         connectionState: 'connecting',
         peerConnection,
-        score: 0.5,
+        score: {
+          overall: 0.5,
+          latency: 0.5,
+          uploadSpeed: 0.5,
+          reliability: 0.5
+        },
         availableSegments: new Set(),
         lastActive: Date.now(),
         metrics: {
@@ -951,7 +964,10 @@ export class PeerManager {
     
     // Need minimum data for accurate scoring
     if (totalRequests === 0) {
-      peer.score = 0.5;
+      peer.score.overall = 0.5;
+      peer.score.latency = 0.5;
+      peer.score.uploadSpeed = 0.5;
+      peer.score.reliability = 0.5;
       return;
     }
 
@@ -969,25 +985,30 @@ export class PeerManager {
     // Assume 1MB per segment is good, normalize to 0-1
     const uploadSpeedScore = Math.min(1, avgBytesPerRequest / (1024 * 1024));
 
+    // Update individual scores
+    peer.score.reliability = reliabilityScore;
+    peer.score.latency = latencyScore;
+    peer.score.uploadSpeed = uploadSpeedScore;
+
     // Weighted combination
-    peer.score = (
+    peer.score.overall = (
       reliabilityScore * 0.5 +
       latencyScore * 0.3 +
       uploadSpeedScore * 0.2
     );
 
     console.log(
-      `[PeerManager] Updated score for ${peerId}: ${peer.score.toFixed(3)} ` +
+      `[PeerManager] Updated score for ${peerId}: ${peer.score.overall.toFixed(3)} ` +
       `(reliability: ${reliabilityScore.toFixed(2)}, latency: ${latencyScore.toFixed(2)}, ` +
       `upload: ${uploadSpeedScore.toFixed(2)})`
     );
 
-    this.emit('peerScoreUpdated', peerId, peer.score);
+    this.emit('peerScoreUpdated', peerId, peer.score.overall);
 
     // Disconnect if score too low (after minimum sample size)
     const config = this.configManager.getConfig();
-    if (peer.score < config.peerScoreThreshold && totalRequests >= 5) {
-      console.log(`[PeerManager] Disconnecting low-scored peer ${peerId} (score: ${peer.score.toFixed(3)})`);
+    if (peer.score.overall < config.peerScoreThreshold && totalRequests >= 5) {
+      console.log(`[PeerManager] Disconnecting low-scored peer ${peerId} (score: ${peer.score.overall.toFixed(3)})`);
       this.disconnectPeer(peerId);
     }
   }
@@ -1012,7 +1033,7 @@ export class PeerManager {
 
         candidates.push({
           peerId,
-          score: peer.score,
+          score: peer.score.overall,
           latency: peer.metrics.avgLatency,
           successRate,
           availability: 1.0,
@@ -1123,13 +1144,13 @@ export class PeerManager {
   /**
    * Disconnect lowest scored peer to make room for new connections
    */
-  private disconnectLowestScoredPeer(): void {
+  disconnectLowestScoredPeer(): void {
     let lowestScore = Infinity;
     let lowestPeerId: string | null = null;
 
     this.peers.forEach((peer, peerId) => {
-      if (peer.connectionState === 'connected' && peer.score < lowestScore) {
-        lowestScore = peer.score;
+      if (peer.connectionState === 'connected' && peer.score.overall < lowestScore) {
+        lowestScore = peer.score.overall;
         lowestPeerId = peerId;
       }
     });
@@ -1187,7 +1208,7 @@ export class PeerManager {
       stats.push({
         peerId,
         state: peer.connectionState,
-        score: peer.score,
+        score: peer.score.overall,
         successRate: totalRequests > 0 ? peer.metrics.successCount / totalRequests : 0,
         avgLatency: peer.metrics.avgLatency,
         totalBytes: peer.metrics.bytesReceived,
@@ -1219,30 +1240,103 @@ export class PeerManager {
   }
 
   /**
-   * Event emitter - subscribe to events
+   * Get peer info (IPeerConnectionManager interface)
    */
-  on<K extends keyof PeerManagerEvents>(event: K, listener: PeerManagerEvents[K]): void {
-    this.eventListeners[event] = listener;
+  getPeer(peerId: string): PeerInfo | undefined {
+    return this.peers.get(peerId);
   }
 
   /**
-   * Emit event to listeners
+   * Get peer info (backward compatibility)
    */
-  private emit<K extends keyof PeerManagerEvents>(
-    event: K,
-    ...args: Parameters<NonNullable<PeerManagerEvents[K]>>
-  ): void {
-    const listener = this.eventListeners[event];
-    if (listener) {
-      // @ts-expect-error - TypeScript has trouble with spread args
-      listener(...args);
+  getPeerInfo(peerId: string): PeerInfo | undefined {
+    return this.peers.get(peerId);
+  }
+
+  /**
+   * Check if peer is connected
+   */
+  isPeerConnected(peerId: string): boolean {
+    const peer = this.peers.get(peerId);
+    return peer?.connectionState === 'connected';
+  }
+
+  /**
+   * Fetch segment from peer (IPeerManager interface)
+   */
+  async fetchFromPeer(peer: PeerInfo, segment: SegmentMetadata): Promise<FetchResult> {
+    return this.fetchSegmentFromPeer(peer.peerId, segment);
+  }
+
+  /**
+   * Set scoring strategy (not implemented yet)
+   */
+  setScoringStrategy(_strategy: any): void {
+    console.warn('[PeerManager] setScoringStrategy not implemented yet');
+  }
+
+  /**
+   * Check if peer has segment
+   */
+  peerHasSegment(peerId: string, segmentKey: string): boolean {
+    const peer = this.peers.get(peerId);
+    return peer?.availableSegments.has(segmentKey) ?? false;
+  }
+
+  /**
+   * Get peers with segment
+   */
+  getPeersWithSegment(segmentKey: string): string[] {
+    const peers: string[] = [];
+    this.peers.forEach((peer, peerId) => {
+      if (peer.availableSegments.has(segmentKey)) {
+        peers.push(peerId);
+      }
+    });
+    return peers;
+  }
+
+  /**
+   * Update peer score (IPeerScorer interface)
+   */
+  updateScore(peerId: string, metrics: { latency?: number; uploadSpeed?: number; reliability?: number }): void {
+    const peer = this.peers.get(peerId);
+    if (!peer) return;
+
+    if (metrics.latency !== undefined) {
+      peer.score.latency = metrics.latency;
     }
+    if (metrics.uploadSpeed !== undefined) {
+      peer.score.uploadSpeed = metrics.uploadSpeed;
+    }
+    if (metrics.reliability !== undefined) {
+      peer.score.reliability = metrics.reliability;
+    }
+
+    // Recalculate overall score (weighted average)
+    const weights = { latency: 0.3, uploadSpeed: 0.4, reliability: 0.3 };
+    peer.score.overall =
+      peer.score.latency * weights.latency +
+      peer.score.uploadSpeed * weights.uploadSpeed +
+      peer.score.reliability * weights.reliability;
+
+    this.emit('peerScoreUpdated', peerId, peer.score.overall);
+  }
+
+  /**
+   * Get best peers (IPeerScorer interface)
+   */
+  getBestPeers(count: number): string[] {
+    return Array.from(this.peers.entries())
+      .sort((a, b) => b[1].score.overall - a[1].score.overall)
+      .slice(0, count)
+      .map(([peerId]) => peerId);
   }
 
   /**
    * Cleanup all connections and resources
    */
-  dispose(): void {
+  destroy(): void {
     console.log('[PeerManager] Disposing all peer connections');
     
     // Clear all pending requests
@@ -1255,7 +1349,5 @@ export class PeerManager {
     // Disconnect all peers
     this.peers.forEach((_, peerId) => this.disconnectPeer(peerId));
     this.peers.clear();
-    
-    this.eventListeners = {};
   }
 }

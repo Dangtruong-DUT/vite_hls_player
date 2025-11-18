@@ -34,20 +34,20 @@ export interface StreamingPlayerEvents {
 
 export class StreamingPlayerCoordinator {
   // Core modules
-  private configManager: ConfigManager;
-  private mseManager: MseManager;
-  private cacheManager: CacheManager;
-  private segmentFetcher: SegmentFetcher;
-  private bufferManager: BufferManager;
-  private peerManager: PeerManager;
-  private signalingClient: SignalingClient;
-  private integratedFetchClient: IntegratedSegmentFetchClient;
-  private abrManager: AbrManager;
+  private readonly configManager: ConfigManager;
+  private readonly mseManager: MseManager;
+  private readonly cacheManager: CacheManager;
+  private readonly segmentFetcher: SegmentFetcher;
+  private readonly bufferManager: BufferManager;
+  private readonly peerManager: PeerManager;
+  private readonly signalingClient: SignalingClient;
+  private readonly integratedFetchClient: IntegratedSegmentFetchClient;
+  private readonly abrManager: AbrManager;
 
   // State
-  private videoElement: HTMLVideoElement;
-  private movieId: string;
-  private clientId: string;
+  private readonly videoElement: HTMLVideoElement;
+  private readonly movieId: string;
+  private readonly clientId: string;
   private currentQuality: Quality | null = null;
   private availableQualities: Quality[] = [];
   private currentSegments: SegmentMetadata[] = [];
@@ -144,7 +144,7 @@ export class StreamingPlayerCoordinator {
         if (result.success && result.data) {
           return result.data;
         }
-        
+
         return null;
       } catch (error) {
         console.error(`[Coordinator] Fetch failed for segment ${segment.id}:`, error);
@@ -266,7 +266,7 @@ export class StreamingPlayerCoordinator {
       if (!initialQuality) {
         throw new Error('ABR manager failed to select initial quality');
       }
-      
+
       // Fetch variant playlist
       const variantPlaylist = await this.segmentFetcher.fetchVariantPlaylist(initialQuality.id);
       this.currentSegments = variantPlaylist.segments;
@@ -313,7 +313,7 @@ export class StreamingPlayerCoordinator {
 
     // Get appended segments (now returns string keys like "720p:0")
     const appendedSegments = this.bufferManager.getAppendedSegments();
-    
+
     // Parse segment keys to extract segment IDs
     const segments = appendedSegments
       .map(key => {
@@ -477,7 +477,7 @@ export class StreamingPlayerCoordinator {
 
     if (targetSegmentId !== null) {
       console.log(`[Coordinator] Seek ${time}s → segment ${targetSegmentId}`);
-      
+
       // Get segments around seek point for prefetch
       const prefetchSegments = this.cacheManager.getSegmentsAroundTime(
         this.movieId,
@@ -492,7 +492,7 @@ export class StreamingPlayerCoordinator {
 
     // Perform seek
     this.videoElement.currentTime = time;
-    
+
     // BufferManager will handle prefetching segments around seek position
     // No need to call fetchSegmentsAroundSeek here as BufferManager does it automatically
   }
@@ -610,13 +610,13 @@ export class StreamingPlayerCoordinator {
   dispose(): void {
     console.log('[Coordinator] Disposing streaming player');
 
-    this.bufferManager.dispose();
-    this.mseManager.dispose();
-    this.peerManager.dispose();
-    this.signalingClient.dispose();
+    this.bufferManager.destroy();
+    this.mseManager.destroy();
+    this.peerManager.destroy();
+    this.signalingClient.destroy();
     this.cacheManager.clear();
     this.segmentFetcher.cancelAllFetches();
-    this.integratedFetchClient.dispose();
+    this.integratedFetchClient.destroy();
 
     this.isInitialized = false;
     this.eventListeners = {};
