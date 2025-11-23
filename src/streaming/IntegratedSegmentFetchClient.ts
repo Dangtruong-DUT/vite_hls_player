@@ -1,8 +1,3 @@
-/**
- * Integrated Segment Fetch Logic
- * Handles P2P fetch with HTTP fallback, caching, and sequential buffer append
- */
-
 import type {
   SegmentMetadata,
   FetchResult,
@@ -39,6 +34,9 @@ export interface SegmentFetchStats {
  * Integrated segment fetch coordinator with P2P + HTTP fallback
  */
 export class IntegratedSegmentFetchClient implements IFetchStrategy {
+  readonly name: FetchSource = 'seeder';
+  readonly priority: number = 1;
+
   private movieId: string;
   private signalingClient: SignalingClient;
   private peerManager: PeerManager;
@@ -92,28 +90,31 @@ export class IntegratedSegmentFetchClient implements IFetchStrategy {
   }
 
   /**
+   * Check if this strategy can handle the segment (IFetchStrategy interface)
+   */
+  async canHandle(_segment: SegmentMetadata, _critical?: boolean): Promise<boolean> {
+    // This strategy can handle all segments
+    return true;
+  }
+
+  /**
    * Fetch segment (IFetchStrategy interface)
    */
-  async fetch(segment: SegmentMetadata): Promise<ArrayBuffer | null> {
+  async fetch(segment: SegmentMetadata, _timeout: number): Promise<FetchResult> {
     const result = await this.fetchSegment({
       segment,
       priority: 1,
       forSeek: false,
       critical: false,
     });
-    return result.success ? result.data : null;
+    return result;
   }
 
-  /**
-   * Main entry point: Fetch segment with full P2P + HTTP fallback logic
-   */
   async fetchSegment(request: SegmentFetchRequest): Promise<FetchResult> {
     const { segment, forSeek, critical } = request;
     const segmentKey = this.getSegmentKey(segment);
 
-    // Check if already appended - if so, skip entirely to avoid re-fetch loop
     if (this.appendedSegments.has(segmentKey)) {
-      // Return cache hit result if available
       const cached = this.cacheManager.getSegment(this.movieId, segment.qualityId, segment.id);
       if (cached) {
         return {
@@ -124,15 +125,12 @@ export class IntegratedSegmentFetchClient implements IFetchStrategy {
         };
       }
       
-      // Already appended but not in cache (shouldn't happen normally)
       return {
         success: true,
         source: 'cache',
         latency: 0,
       };
     }
-
-    // Check if already fetching
     if (this.activeFetches.has(segmentKey)) {
       const existingPromise = this.activeFetches.get(segmentKey)!;
       
@@ -292,9 +290,11 @@ export class IntegratedSegmentFetchClient implements IFetchStrategy {
           // Cache the segment
           this.cacheSegment(segment, p2pResult.data);
 
-          // NOTE: Do NOT report to signaling when fetched from P2P
-          // Because the peer already has it and reported it - we just share the cached copy
-          // Only report when we fetch from Seeder (new data entering the P2P network)
+          // IMPORTANT: Report to signaling server even when fetched from P2P
+          // This updates the signaling server that WE now have this segment available
+          // Other peers need to know we have it for future whoHas queries
+          this.reportSegmentToSignaling(segment, 'peer');
+          console.log(`[IntegratedFetch] ✓ P2P segment ${segmentKey} cached and reported to signaling`);
 
           // Queue for append
           await this.queueSegmentForAppend(segment, p2pResult.data, p2pResult.source);

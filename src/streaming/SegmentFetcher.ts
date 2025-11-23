@@ -1,9 +1,3 @@
-/**
- * Segment Fetcher
- * Fetches segments from peers or fallback to seeder/origin
- * Handles playlists and init segments
- */
-
 import type {
   FetchSource,
   FetchResult,
@@ -51,7 +45,7 @@ export class SegmentFetcher implements ISegmentFetcher {
 
     // Fetch from seeder
     const config = this.configManager.getConfig();
-    const url = `${config.baseUrl}/streams/movies/${this.movieId}/master.m3u8`;
+    const url = this.configManager.getSeederUrl(this.movieId, '', 'master');
 
     try {
       const response = await this.fetchWithTimeout(url, config.fetchTimeout);
@@ -79,7 +73,7 @@ export class SegmentFetcher implements ISegmentFetcher {
 
     // Fetch from seeder
     const config = this.configManager.getConfig();
-    const url = `${config.baseUrl}/streams/movies/${this.movieId}/${qualityId}/playlist.m3u8`;
+    const url = this.configManager.getSeederUrl(this.movieId, qualityId, 'playlist');
 
     try {
       const response = await this.fetchWithTimeout(url, config.fetchTimeout);
@@ -107,7 +101,7 @@ export class SegmentFetcher implements ISegmentFetcher {
 
     // Fetch from seeder
     const config = this.configManager.getConfig();
-    const url = `${config.baseUrl}/streams/movies/${this.movieId}/${qualityId}/init.${ext}`;
+    const url = this.configManager.getSeederUrl(this.movieId, qualityId, `init.${ext}`);
 
     try {
       const response = await this.fetchWithTimeout(url, config.fetchTimeout);
@@ -172,7 +166,7 @@ export class SegmentFetcher implements ISegmentFetcher {
     const timeout = options.timeout ?? config.fetchTimeout;
     const maxRetries = options.retries ?? config.maxRetries;
 
-    const url = `${config.baseUrl}/streams/movies/${this.movieId}/${segment.qualityId}/${segment.id}`;
+    const url = this.configManager.getSeederUrl(this.movieId, segment.qualityId, segment.id);
     const fetchKey = `${segment.qualityId}:${segment.id}`;
 
     let lastError: Error | null = null;

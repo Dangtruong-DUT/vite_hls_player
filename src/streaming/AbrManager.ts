@@ -1,16 +1,3 @@
-/**
- * AbrManager - Adaptive Bitrate Manager
- * 
- * Advanced ABR logic with:
- * - Each quality variant has separate playlist + init segment
- * - Quality switching: fetch init segment + segments of new quality
- * - StreamId remains unchanged across quality switches
- * - Prefetch next segments in new quality after switch
- * - Cache and P2P lookup by (movieId, qualityId, segmentId)
- * - Seek support: fetch init + surrounding segments in current quality
- * - Seeder endpoint fallback when needed
- */
-
 import type {
   Quality,
   MasterPlaylist,
@@ -22,7 +9,7 @@ import type {
 import { PeerManager } from './PeerManager';
 import { SignalingClient } from './SignalingClient';
 import { CacheManager } from './CacheManager';
-import { ConfigManager } from './ConfigManager';
+import { ConfigManager, APP_CONSTANTS } from './ConfigManager';
 import { EventEmitter } from './interfaces/IEventEmitter';
 import type { IBandwidthEstimationStrategy, IQualitySelectionStrategy } from './interfaces/IAbrManager';
 
@@ -75,21 +62,15 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     this.configManager = configManager;
   }
 
-  /**
-   * Initialize ABR with master playlist
-   * Loads all variant playlists and init segments for each quality
-   */
   async initialize(masterPlaylist: MasterPlaylist): Promise<void> {
     this.masterPlaylist = masterPlaylist;
     
     console.log(`[AbrManager] Initializing with ${masterPlaylist.qualities.length} quality variants`);
 
-    // Load variant playlists for all qualities
     await Promise.all(
       masterPlaylist.qualities.map(quality => this.loadVariantPlaylist(quality.id))
     );
 
-    // Set initial quality
     const defaultQualityId = masterPlaylist.defaultQualityId || masterPlaylist.qualities[0].id;
     const defaultQuality = masterPlaylist.qualities.find(q => q.id === defaultQualityId);
     
@@ -143,31 +124,23 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
 
-      // Parse target duration
       if (line.startsWith('#EXT-X-TARGETDURATION:')) {
         targetDuration = parseFloat(line.split(':')[1]);
       }
 
-      // Parse segment info
       if (line.startsWith('#EXTINF:')) {
         const duration = parseFloat(line.split(':')[1].split(',')[0]);
         const nextLine = lines[i + 1];
         
         if (nextLine && !nextLine.startsWith('#')) {
-          // Extract segment ID from filename (e.g., "seg_0042.m4s" or "42.m4s")
+          // Extract segment ID from filename (e.g., "seg_0042.m4s")
           let segmentId: string;
-          const newFormatMatch = nextLine.match(/(seg_\d+\.m4s)/);
-          const oldFormatMatch = nextLine.match(/(\d+)\.m4s/);
-          
-          if (newFormatMatch) {
-            segmentId = newFormatMatch[1]; // "seg_0042.m4s"
-          } else if (oldFormatMatch) {
-            // Convert old format to new format
-            const numId = parseInt(oldFormatMatch[1], 10);
-            segmentId = `seg_${String(numId).padStart(4, '0')}.m4s`;
+          const formatMatch = nextLine.match(APP_CONSTANTS.SEGMENT_PATTERNS.REGEX);
+
+          if (formatMatch) {
+            segmentId = formatMatch[0]; // "seg_0042.m4s"
           } else {
-            // Fallback: use index
-            segmentId = `seg_${String(segments.length).padStart(4, '0')}.m4s`;
+            throw new Error(`Failed to extract segment ID from: ${nextLine}`);
           }
 
           segments.push({
@@ -194,14 +167,9 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     };
   }
 
-  /**
-   * Set quality (switch or initial)
-   * Fetches init segment and prepares for new quality
-   */
   async setQuality(quality: Quality, reason: string): Promise<void> {
     const oldQuality = this.currentQuality;
 
-    // Skip if already at this quality
     if (oldQuality?.id === quality.id && !this.isQualitySwitching) {
       return;
     }
@@ -211,16 +179,10 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     this.isQualitySwitching = true;
 
     try {
-      // 1. Fetch init segment for new quality (if not cached)
       await this.ensureInitSegment(quality.id);
-
-      // 2. Update current quality
       this.currentQuality = quality;
       this.isQualitySwitching = false;
-
-      // 3. Emit event
       this.emit('qualityChanged', oldQuality, quality, reason);
-
       console.log(`[AbrManager] Quality switched to ${quality.id}`);
     } catch (error) {
       console.error(`[AbrManager] Failed to switch quality:`, error);
@@ -276,13 +238,6 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     }
   }
 
-  /**
-   * Fetch segment with cache and P2P lookup by (movieId, qualityId, segmentId)
-   * 
-   * @param segmentId - Segment ID (format: "seg_0001.m4s")
-   * @param qualityId - Quality ID (optional, uses current quality if not specified)
-   * @returns Segment data
-   */
   async fetchSegment(
     segmentId: string,
     qualityId?: string
@@ -303,7 +258,6 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
       throw new Error(`Segment ${segmentId} not found in ${targetQualityId} playlist`);
     }
 
-    // 1. Check cache first - lookup by (movieId, qualityId, segmentId)
     const cacheKey = `${this.movieId}:${targetQualityId}:${segmentId}`;
     const cached = this.cacheManager.get<ArrayBuffer>(cacheKey);
 
@@ -312,9 +266,6 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
       this.emit('segmentFetched', segmentId, targetQualityId, 'cache');
       return cached;
     }
-
-    // 2. Try P2P fetch - lookup by (movieId, qualityId, segmentId)
-    console.log(`[AbrManager] Fetching segment ${cacheKey} via P2P`);
     
     const startTime = Date.now();
     const result = await this.peerManager.fetchSegment(segment);
@@ -330,8 +281,7 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
       this.cacheManager.set(cacheKey, result.data, config.cacheSegmentTTL);
 
       // Report to signaling for swarm coordination
-      // Convert segmentId (number) to filename format for signaling protocol
-      const segmentFilename = `segment-${segmentId}.ts`;
+      const segmentFilename = segmentId;
       // Map internal FetchSource to protocol source type
       const reportSource: 'peer' | 'server' | undefined = 
         result.source === 'peer' ? 'peer' : 
@@ -570,9 +520,20 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
 
   /**
    * Update bandwidth estimation based on segment fetch
+   * Uses strategy if available, otherwise falls back to default implementation
    */
   private updateBandwidthEstimate(bytes: number, latencyMs: number): void {
-    const bandwidth = (bytes * 8) / (latencyMs / 1000); // bits per second
+    // Use strategy if available
+    if (this.bandwidthStrategy) {
+      this.bandwidthStrategy.addSample(bytes, latencyMs);
+      this.estimatedBandwidth = this.bandwidthStrategy.getEstimate();
+      this.emit('bandwidthEstimated', this.estimatedBandwidth);
+      return;
+    }
+
+    // Fallback to default implementation
+    const { BITS_PER_BYTE, MS_TO_SECONDS } = APP_CONSTANTS.BANDWIDTH;
+    const bandwidth = (bytes * BITS_PER_BYTE) / (latencyMs / MS_TO_SECONDS);
     
     this.bandwidthSamples.push(bandwidth);
 
@@ -604,99 +565,40 @@ export class AbrManager extends EventEmitter<AbrManagerEvents> {
     ) || null;
   }
 
-  /**
-   * Get current quality
-   */
   getCurrentQuality(): Quality | null {
     return this.currentQuality;
   }
 
-  /**
-   * Get available qualities
-   */
   getAvailableQualities(): Quality[] {
     return this.masterPlaylist?.qualities || [];
   }
 
-  /**
-   * Get variant playlist for quality
-   */
   getPlaylist(qualityId: string): VariantPlaylist | undefined {
     return this.variantPlaylists.get(qualityId);
   }
 
-  /**
-   * Get init segment for quality
-   */
   getInitSegment(qualityId: string): InitSegment | undefined {
     return this.initSegments.get(qualityId);
   }
 
-  /**
-   * Get estimated bandwidth
-   */
   getEstimatedBandwidth(): number {
     return this.estimatedBandwidth;
   }
 
-  /**
-   * Get movie ID (streamId)
-   */
   getMovieId(): string {
     return this.movieId;
   }
 
-  /**
-   * Set bandwidth estimation strategy (IBandwidthEstimator interface)
-   */
   setBandwidthStrategy(strategy: IBandwidthEstimationStrategy): void {
     this.bandwidthStrategy = strategy;
     console.log('[AbrManager] Bandwidth estimation strategy updated');
   }
 
-  /**
-   * Estimate bandwidth (Strategy Pattern)
-   */
-  estimateBandwidth(downloadSize: number, downloadTime: number): number {
-    if (this.bandwidthStrategy) {
-      this.bandwidthStrategy.addSample(downloadSize, downloadTime);
-      const bandwidth = this.bandwidthStrategy.getEstimate();
-      this.estimatedBandwidth = bandwidth;
-      this.emit('bandwidthEstimated', bandwidth);
-      return bandwidth;
-    }
-    
-    // Fallback to existing implementation
-    const bandwidth = (downloadSize * 8) / (downloadTime / 1000); // bits per second
-    this.bandwidthSamples.push(bandwidth);
-    
-    // Keep only recent samples
-    const maxSamples = 5; // Default value since config.abr doesn't exist yet
-    if (this.bandwidthSamples.length > maxSamples) {
-      this.bandwidthSamples.shift();
-    }
-    
-    // Calculate weighted average (recent samples weighted more)
-    const weights = this.bandwidthSamples.map((_, i) => i + 1);
-    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
-    const estimated = this.bandwidthSamples.reduce((sum, bw, i) => sum + (bw * weights[i]), 0) / totalWeight;
-    
-    this.estimatedBandwidth = estimated;
-    this.emit('bandwidthEstimated', estimated);
-    return estimated;
-  }
-
-  /**
-   * Set quality selection strategy (Strategy Pattern)
-   */
   setQualityStrategy(strategy: IQualitySelectionStrategy): void {
     this.qualityStrategy = strategy;
     console.log('[AbrManager] Quality selection strategy updated');
   }
 
-  /**
-   * Cleanup
-   */
   destroy(): void {
     console.log('[AbrManager] Disposing ABR manager');
     this.variantPlaylists.clear();

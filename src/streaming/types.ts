@@ -1,7 +1,3 @@
-/**
- * Core type definitions for streaming video player
- */
-
 // ============ Quality & Segment Types ============
 
 export interface Quality {
@@ -244,6 +240,7 @@ export interface SignalingPeerInfo {
 
 export interface WhoHasReplyMessage extends SignalingMessage {
   type: 'whoHasReply';
+  qualityId: string;     // Quality level (e.g., "720p")
   segmentId: string;     // Format: "seg_0001.m4s" (bao gồm cả extension)
   peers: SignalingPeerInfo[];     // Array of peers with metrics (có thể rỗng)
 }
@@ -355,6 +352,7 @@ export interface StreamingConfig {
   signalingReconnectInterval: number; // ms
   signalingHeartbeatInterval: number; // ms
   whoHasTimeout: number; // ms - timeout for WhoHas query (whohas_query_timeout)
+  signalingUrlTemplate?: string; // Optional custom WebSocket URL template
 
   // Seek optimization settings
   seekPrefetchAhead: number; // number of segments to prefetch ahead on seek
@@ -411,35 +409,6 @@ export interface SegmentRequest {
   priority: number;
   onSuccess: (data: ArrayBuffer, source: FetchSource) => void;
   onError: (error: Error) => void;
-}
-
-// ============ Helper Functions ============
-
-/**
- * Format segment numeric index to standard segment ID string
- * @param index - Segment index (0-based or 1-based)
- * @returns Formatted segment ID string (e.g., "seg_0001.m4s")
- */
-export function formatSegmentId(index: number): string {
-  return `seg_${String(index).padStart(4, '0')}.m4s`;
-}
-
-/**
- * Parse segment ID to extract numeric index
- * @param segmentId - Segment ID (e.g., "seg_0001.m4s" or "42.m4s")
- * @returns Numeric index
- */
-export function parseSegmentIndex(segmentId: string): number {
-  const newFormatMatch = segmentId.match(/seg_(\d+)\.m4s/);
-  const oldFormatMatch = segmentId.match(/(\d+)\.m4s/);
-  
-  if (newFormatMatch) {
-    return parseInt(newFormatMatch[1], 10);
-  } else if (oldFormatMatch) {
-    return parseInt(oldFormatMatch[1], 10);
-  }
-  
-  return 0;
 }
 
 /**

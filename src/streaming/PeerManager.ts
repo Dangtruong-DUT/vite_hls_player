@@ -1,20 +1,6 @@
-/**
- * PeerManager
- * 
- * Advanced P2P connection manager with:
- * - Peer scoring based on latency, upload speed, and reliability
- * - Max concurrent peer connections limit
- * - Lazy connection + staggered requests with random delays
- * - Automatic retry on failure
- * - Connection cleanup after fetch completion
- * - Multi-quality ABR support with quality-based segment lookup
- * - Support for fetching segments around seek position
- * - Automatic fallback to HTTP endpoint on peer failure
- */
-
 import type { PeerInfo, PeerScore, SegmentMetadata, FetchResult } from './types';
 import { SignalingClient } from './SignalingClient';
-import { ConfigManager } from './ConfigManager';
+import { ConfigManager, APP_CONSTANTS } from './ConfigManager';
 import { CacheManager } from './CacheManager';
 import { EventEmitter } from './interfaces/IEventEmitter';
 import type { IPeerManager } from './interfaces/IPeerManager';
@@ -39,6 +25,13 @@ interface PendingSegmentRequest {
   receivedChunks?: number;
 }
 
+interface PingRequest {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  timeout: ReturnType<typeof setTimeout>;
+  startTime: number;
+}
+
 export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPeerManager {
   private configManager: ConfigManager;
   private signalingClient: SignalingClient;
@@ -46,16 +39,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
   private movieId: string;
   private peers = new Map<string, PeerInfo>();
   private pendingRequests = new Map<string, PendingSegmentRequest>(); // requestId -> request
-  private iceServers: RTCIceServer[] = [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun1.l.google.com:19302' },
-  ];
+  private pendingPings = new Map<string, PingRequest>(); // requestId -> ping request
+  private iceServers: RTCIceServer[] = [...APP_CONSTANTS.WEBRTC.ICE_SERVERS];
   private requestIdCounter = 0;
   private lastStaggerDelay = 0;
   // Track recent signaling messages to prevent duplicates
   private recentOffers = new Map<string, number>(); // peerId -> timestamp
   private recentAnswers = new Map<string, number>(); // peerId -> timestamp
-  private readonly SIGNALING_DEBOUNCE_MS = 500; // Ignore duplicates within 500ms
+  private readonly SIGNALING_DEBOUNCE_MS = APP_CONSTANTS.TIMING.SIGNALING_DEBOUNCE;
 
   constructor(
     movieId: string,
@@ -117,9 +108,10 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
 
     // Create peer connection
     const peerConnection = new RTCPeerConnection({ iceServers: this.iceServers });
-    const dataChannel = peerConnection.createDataChannel('segments', {
-      ordered: true,
-      maxRetransmits: 3,
+    const { NAME, ORDERED, MAX_RETRANSMITS } = APP_CONSTANTS.WEBRTC.DATA_CHANNEL;
+    const dataChannel = peerConnection.createDataChannel(NAME, {
+      ordered: ORDERED,
+      maxRetransmits: MAX_RETRANSMITS,
     });
 
     const peerInfo: PeerInfo = {
@@ -198,7 +190,7 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
         console.log(`[PeerManager] Peer ${peerId} already exists, cleaning up old connection`);
         this.disconnectPeer(peerId);
         // Wait a bit for cleanup to complete
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise(resolve => setTimeout(resolve, APP_CONSTANTS.TIMING.RECONNECT_CLEANUP_DELAY));
       }
 
       // Check max peers limit before accepting
@@ -418,6 +410,32 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
       try {
         const message = JSON.parse(data);
         
+        // Handle ping requests
+        if (message.type === 'ping') {
+          // Respond with pong
+          const pongResponse = {
+            type: 'pong',
+            requestId: message.requestId,
+            timestamp: Date.now(),
+          };
+          if (peerInfo.dataChannel?.readyState === 'open') {
+            peerInfo.dataChannel.send(JSON.stringify(pongResponse));
+          }
+          return;
+        }
+        
+        // Handle pong responses
+        if (message.type === 'pong') {
+          const requestId = message.requestId;
+          const pendingPing = this.pendingPings.get(requestId);
+          if (pendingPing) {
+            clearTimeout(pendingPing.timeout);
+            this.pendingPings.delete(requestId);
+            pendingPing.resolve();
+          }
+          return;
+        }
+        
         // Handle segment availability updates
         if (message.type === 'segmentAvailability') {
           message.segments.forEach((segmentKey: string) => {
@@ -479,12 +497,14 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
               offset += chunk.byteLength;
             }
             
+            console.log(`[PeerManager] Received all ${totalChunks} chunks (${totalSize} bytes total) for request ${requestId}`);
             clearTimeout(pending.timeout);
             this.pendingRequests.delete(requestId);
             pending.resolve(combined);
           }
         } else {
           // Single chunk - resolve immediately
+          console.log(`[PeerManager] Received complete segment data (${segmentData.byteLength} bytes) for request ${requestId}`);
           clearTimeout(pending.timeout);
           this.pendingRequests.delete(requestId);
           pending.resolve(segmentData);
@@ -649,10 +669,26 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
       };
     }
 
+    // CRITICAL: Ping peer first to verify data channel is actually responsive
+    // This detects "zombie" connections that appear open but don't respond
+    const isResponsive = await this.pingPeer(peer, 2000);
+    if (!isResponsive) {
+      console.warn(`[PeerManager] Peer ${peerId} not responsive to ping, disconnecting`);
+      this.disconnectPeer(peerId);
+      return {
+        success: false,
+        source: 'peer' as const,
+        peerId,
+        latency: Date.now() - startTime,
+        error: new Error('Peer not responsive (failed ping test)'),
+      };
+    }
+
     // Verify peer has the segment
     const segmentKey = `${segment.qualityId}:${segment.id}`;
     if (!peer.availableSegments.has(segmentKey)) {
-      console.warn(`[PeerManager] Peer ${peerId} doesn't have segment ${segmentKey}`);
+      const availableSegments = Array.from(peer.availableSegments).slice(0, 5);
+      console.warn(`[PeerManager] Peer ${peerId} doesn't have segment ${segmentKey}. Available: [${availableSegments.join(', ')}...]`);
       return {
         success: false,
         source: 'peer' as const,
@@ -681,8 +717,18 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
         };
       }
 
-      // Create request
+      // Create request ID
       const requestId = (this.requestIdCounter++).toString();
+      
+      // CRITICAL FIX: Setup pending request BEFORE sending to avoid race condition
+      // If response comes before we set up the listener, it will be lost
+      const segmentTimeout = Math.min(5000, config.fetchTimeout); // Reduced to 5s for faster failover
+      const dataPromise = this.waitForSegmentData(requestId, peer, segmentTimeout);
+      
+      // Small delay to ensure promise listener is setup
+      await new Promise(resolve => setTimeout(resolve, 0));
+      
+      // Now send the request
       const request = {
         type: 'segmentRequest',
         requestId,
@@ -693,8 +739,15 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
       // Send request with try-catch to handle send failures
       try {
         peer.dataChannel.send(JSON.stringify(request));
+        console.log(`[PeerManager] Sent segment request to ${peerId}: ${segment.qualityId}:${segment.id} (requestId: ${requestId})`);
       } catch (sendError) {
         console.error(`[PeerManager] Failed to send request to ${peerId}:`, sendError);
+        // Cancel pending request
+        const pending = this.pendingRequests.get(requestId);
+        if (pending) {
+          clearTimeout(pending.timeout);
+          this.pendingRequests.delete(requestId);
+        }
         return {
           success: false,
           source: 'peer' as const,
@@ -704,9 +757,8 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
         };
       }
 
-      // Wait for response with 10s timeout for large segment data transfer
-      const segmentTimeout = Math.min(10000, config.fetchTimeout);
-      const data = await this.waitForSegmentData(requestId, peer, segmentTimeout);
+      // Wait for response
+      const data = await dataPromise;
 
       // Update metrics - success
       const latency = Date.now() - startTime;
@@ -863,6 +915,49 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
     }
     
     throw new Error('Connection timeout');
+  }
+
+  /**
+   * Ping peer to verify data channel is responsive
+   */
+  private async pingPeer(peer: PeerInfo, timeout: number = 2000): Promise<boolean> {
+    if (!peer.dataChannel || peer.dataChannel.readyState !== 'open') {
+      return false;
+    }
+
+    return new Promise((resolve) => {
+      const requestId = (this.requestIdCounter++).toString();
+      
+      const timer = setTimeout(() => {
+        this.pendingPings.delete(requestId);
+        console.warn(`[PeerManager] Ping timeout for peer ${peer.peerId}`);
+        resolve(false);
+      }, timeout);
+
+      this.pendingPings.set(requestId, {
+        resolve: () => {
+          console.log(`[PeerManager] Ping successful for peer ${peer.peerId}`);
+          resolve(true);
+        },
+        reject: () => resolve(false),
+        timeout: timer,
+        startTime: Date.now(),
+      });
+
+      try {
+        const pingMessage = {
+          type: 'ping',
+          requestId,
+          timestamp: Date.now(),
+        };
+        peer.dataChannel.send(JSON.stringify(pingMessage));
+      } catch (error) {
+        clearTimeout(timer);
+        this.pendingPings.delete(requestId);
+        console.error(`[PeerManager] Failed to send ping to ${peer.peerId}:`, error);
+        resolve(false);
+      }
+    });
   }
 
   /**
@@ -1239,9 +1334,6 @@ export class PeerManager extends EventEmitter<PeerManagerEvents> implements IPee
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  /**
-   * Get peer info (IPeerConnectionManager interface)
-   */
   getPeer(peerId: string): PeerInfo | undefined {
     return this.peers.get(peerId);
   }

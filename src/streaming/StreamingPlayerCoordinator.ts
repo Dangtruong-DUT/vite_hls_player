@@ -1,8 +1,3 @@
-/**
- * Streaming Player Coordinator
- * Orchestrates all streaming modules together for seamless video playback
- */
-
 import type { Quality, SegmentMetadata, PlayerState, PlaybackMetrics } from './types';
 import { ConfigManager } from './ConfigManager';
 import { MseManager } from './MseManager';
@@ -63,13 +58,24 @@ export class StreamingPlayerCoordinator {
     // Initialize configuration
     this.configManager = new ConfigManager(options.configOverrides);
 
-    // Initialize cache với config
-    this.cacheManager = new CacheManager({
+    // Initialize signaling first (needed for cache callback)
+    this.signalingClient = new SignalingClient(
+      this.clientId,
+      this.movieId,
+      this.configManager
+    );
+
+    // Initialize cache with config and segment removal callback
+    this.cacheManager = new CacheManager(this.configManager, {
       maxSize: this.configManager.get('cacheSizeLimit'),
       segmentTTL: 30 * 60 * 1000, // 30 minutes
       initTTL: 24 * 60 * 60 * 1000, // 24 hours
       playlistTTL: 60 * 60 * 1000, // 1 hour
       hotCacheProtection: true, // Enable hot cache protection
+      // Callback to notify signaling server when segment is removed from cache
+      onSegmentRemoved: (movieId: string, qualityId: string, segmentId: string) => {
+        this.signalingClient.reportSegmentRemoval(segmentId, qualityId);
+      },
     });
 
     // Initialize MSE
@@ -89,12 +95,8 @@ export class StreamingPlayerCoordinator {
       this.configManager
     );
 
-    // Initialize signaling
-    this.signalingClient = new SignalingClient(
-      this.clientId,
-      this.movieId,
-      this.configManager
-    );
+    // Inject cache manager for cleanup operations
+    this.bufferManager.setCacheManager(this.cacheManager);
 
     // Initialize peer manager
     this.peerManager = new PeerManager(
@@ -200,13 +202,15 @@ export class StreamingPlayerCoordinator {
     this.signalingClient.on('whoHasReply', (message) => {
       // Update peer availability information
       if (message.peers && message.peers.length > 0) {
+        // Construct proper segment key with qualityId:segmentId format
+        const segmentKey = `${message.qualityId}:${message.segmentId}`;
         message.peers.forEach(peer => {
-          this.peerManager.updatePeerSegmentAvailability(peer.peerId, [message.segmentId]);
+          this.peerManager.updatePeerSegmentAvailability(peer.peerId, [segmentKey]);
         });
       }
     });
 
-    this.signalingClient.on('peerList', (message) => {
+    this.signalingClient.on('peerList', () => {
       // Handle initial peer list from server
     });
 
@@ -310,23 +314,6 @@ export class StreamingPlayerCoordinator {
    */
   private reportAvailableSegments(): void {
     if (!this.currentQuality) return;
-
-    // Get appended segments (now returns string keys like "720p:0")
-    const appendedSegments = this.bufferManager.getAppendedSegments();
-
-    // Parse segment keys to extract segment IDs
-    const segments = appendedSegments
-      .map(key => {
-        const parts = key.split(':');
-        if (parts.length === 2) {
-          return {
-            qualityId: parts[0],
-            segmentId: parseInt(parts[1], 10),
-          };
-        }
-        return null;
-      })
-      .filter((seg): seg is { qualityId: string; segmentId: number } => seg !== null);
 
     // Note: reportSegmentAvailability has been replaced with individual reportSegment calls
     // Segments are reported as they are fetched via signalingClient.reportSegmentFetch()

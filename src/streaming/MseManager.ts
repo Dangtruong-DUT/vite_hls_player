@@ -1,19 +1,7 @@
-/**
- * MSE (Media Source Extensions) Manager v2
- * Refactored to follow SOLID principles
- * Quản lý MediaSource với đầy đủ tính năng:
- * - Append init segment trước khi append media segments
- * - Sequential append từ buffer
- * - Cập nhật duration từ playlist
- * - ABR multi-quality switch
- * - Playback control (play/pause/seek)
- * - Seek support với prefetch init + surrounding segments
- * - Integration với BufferManager
- */
-
 import type { Quality, InitSegment, BufferRange } from './types';
 import type { IMseManager } from './interfaces/IMseManager';
 import { EventEmitter } from './interfaces/IEventEmitter';
+import { APP_CONSTANTS } from './ConfigManager';
 
 export interface MseManagerEvents {
   sourceOpen: () => void;
@@ -25,6 +13,7 @@ export interface MseManagerEvents {
   playbackStateChanged: (state: 'playing' | 'paused' | 'buffering' | 'ended') => void;
   seekStart: (targetTime: number) => void;
   seekEnd: (targetTime: number) => void;
+  [event: string]: (...args: any[]) => void;
 }
 
 /**
@@ -113,7 +102,7 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
   /**
    * Initialize MediaSource và attach to video element
    */
-  async initialize(mimeType = 'video/mp4; codecs="avc1.64001f,mp4a.40.2"'): Promise<void> {
+  async initialize(mimeType: string = APP_CONSTANTS.MIME_TYPES.DEFAULT_VIDEO): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
         // Check MediaSource support
@@ -312,15 +301,19 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
     // Xóa tất cả buffer sau currentTime để loại bỏ segment prefetch cũ
     const currentTime = this.videoElement.currentTime;
     const buffered = this.getBufferedRanges();
+    
+    // Giữ buffer một khoảng nhỏ sau currentTime để tránh gap (0.5s)
+    const safeOffset = 0.5;
 
     for (const range of buffered) {
-      // Xóa ngay sau currentTime để đảm bảo segment tiếp theo sẽ là chất lượng mới
-      if (range.end > currentTime) {
+      // Xóa sau currentTime + safeOffset để đảm bảo không gây gap
+      const removeStart = currentTime + safeOffset;
+      
+      if (range.end > removeStart && removeStart < range.end) {
         try {
-          // Giữ buffer đến currentTime, xóa tất cả sau đó
-          const removeStart = Math.max(range.start, currentTime);
+          // Giữ buffer đến currentTime + safeOffset, xóa sau đó
           await this.removeBuffer(removeStart, range.end);
-          console.log(`[MseManager] Removed buffer from ${removeStart.toFixed(2)}s to ${range.end.toFixed(2)}s`);
+          console.log(`[MseManager] Removed buffer from ${removeStart.toFixed(2)}s to ${range.end.toFixed(2)}s (safe offset: ${safeOffset}s)`);
         } catch (error) {
           console.warn('[MseManager] Failed to remove buffer during quality switch:', error);
         }
@@ -370,6 +363,13 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
     }
 
     console.log(`[MseManager] Ready for seek to ${targetTime.toFixed(2)}s`);
+  }
+
+  /**
+   * Remove buffer range (interface implementation)
+   */
+  async removeBufferRange(start: number, end: number): Promise<void> {
+    return this.removeBuffer(start, end);
   }
 
   /**
@@ -595,9 +595,6 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
     return this.initSegmentAppended;
   }
 
-  /**
-   * Set current quality (IMseManager interface)
-   */
   setCurrentQuality(quality: Quality): void {
     const oldQuality = this.currentQuality;
     this.currentQuality = quality;
@@ -628,13 +625,6 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
   }
 
   /**
-   * Update state (IPlaybackStateManager interface)
-   */
-  updateState(state: 'playing' | 'paused' | 'buffering' | 'ended'): void {
-    this.updatePlaybackState(state);
-  }
-
-  /**
    * Check if updating (ISourceBufferManager interface)
    */
   isUpdating(): boolean {
@@ -642,8 +632,27 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
   }
 
   /**
-   * Cleanup và dispose resources
+   * Abort any ongoing operations (ISourceBufferManager interface)
    */
+  abort(): void {
+    if (this.sourceBuffer && !this.sourceBuffer.updating) {
+      try {
+        this.sourceBuffer.abort();
+        this.pendingSegments = [];
+        console.log('[MseManager] SourceBuffer aborted');
+      } catch (error) {
+        console.error('[MseManager] Error aborting SourceBuffer:', error);
+      }
+    }
+  }
+
+  /**
+   * Check if playback has ended (IPlaybackStateManager interface)
+   */
+  isEnded(): boolean {
+    return this.videoElement.ended;
+  }
+
   destroy(): void {
     console.log('[MseManager] Disposing');
 
@@ -681,6 +690,5 @@ export class MseManager extends EventEmitter<MseManagerEvents> implements IMseMa
     this.isAppending = false;
     this.totalDuration = 0;
     this.playbackState = 'paused';
-    this.eventListeners = {};
   }
 }

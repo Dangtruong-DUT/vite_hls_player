@@ -1,13 +1,3 @@
-/**
- * SignalingClient
- * 
- * WebSocket signaling client theo Streaming Signaling Protocol v1.0.0
- * - whoHas: Tìm peer có segment
- * - reportSegment: Báo cáo đã tải segment với metrics
- * - WebRTC signaling: rtcOffer, rtcAnswer, iceCandidate
- * - Nhận peerList, whoHasReply, reportAck từ server
- */
-
 import type { 
   WhoHasRequest,
   WhoHasReplyMessage,
@@ -22,7 +12,7 @@ import type {
   IceCandidateMessage,
   ErrorMessage
 } from './types';
-import { ConfigManager } from './ConfigManager';
+import { ConfigManager, APP_CONSTANTS } from './ConfigManager';
 import { EventEmitter } from './interfaces/IEventEmitter';
 import type { ISignalingClient } from './interfaces/ISignalingClient';
 
@@ -58,21 +48,18 @@ export class SignalingClient extends EventEmitter<SignalingClientEvents> impleme
     response: WhoHasReplyMessage;
     timestamp: number;
   }>();
-  private seederEndpoint: string;
   private signalingUrl: string;
 
   constructor(
     clientId: string,
     movieId: string,
-    configManager: ConfigManager,
-    seederEndpoint = '/api/v1/streams/movies'
+    configManager: ConfigManager
   ) {
     super();
     this.clientId = clientId;
     this.movieId = movieId;
     this.configManager = configManager;
-    this.seederEndpoint = seederEndpoint;
-    this.signalingUrl = `ws://localhost:8080/ws/signaling?clientId=${clientId}&movieId=${movieId}`;
+    this.signalingUrl = this.configManager.buildSignalingUrl(clientId, movieId);
   }
 
   /**
@@ -160,10 +147,10 @@ export class SignalingClient extends EventEmitter<SignalingClientEvents> impleme
       throw new Error('Not connected to signaling server');
     }
 
-    // Check cache first (cache for 5 seconds)
+    // Check cache first
     const cacheKey = `${this.movieId}_${qualityId}_${segmentId}`;
     const cached = this.whoHasCache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < 5000) {
+    if (cached && Date.now() - cached.timestamp < APP_CONSTANTS.TIMING.WHOHAS_CACHE_TTL) {
       console.log(`[SignalingClient] Using cached whoHas result for ${segmentId} (${cached.response.peers.length} peers)`);
       return cached.response;
     }
@@ -251,22 +238,44 @@ export class SignalingClient extends EventEmitter<SignalingClientEvents> impleme
   }
 
   /**
+   * Report segment removal - Báo cáo segment đã bị xóa khỏi cache
+   * This notifies the signaling server that this peer no longer has the segment
+   * Protocol: Client -> Server message type 'removeSegment' (new)
+   * 
+   * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
+   * @param qualityId - Quality level
+   */
+  reportSegmentRemoval(
+    segmentId: string,
+    qualityId: string
+  ): void {
+    if (!this._isConnected) {
+      console.warn('[SignalingClient] Not connected, cannot report segment removal');
+      return;
+    }
+
+    const report = {
+      type: 'removeSegment',
+      movieId: this.movieId,
+      qualityId,
+      segmentId,
+    };
+
+    console.log(`[SignalingClient] Reporting segment removal: ${qualityId}:${segmentId}`);
+
+    this.send(report);
+  }
+
+  /**
    * Get seeder endpoint URL for HTTP fallback
+   * Now delegates to ConfigManager for centralized URL management
    * 
    * @param qualityId - Quality level ID
    * @param segmentId - Segment ID bao gồm cả extension (ví dụ: "seg_0001.m4s")
    * @returns Full URL to fetch from seeder (e.g., /api/v1/streams/movies/{movieId}/{qualityId}/seg_0001.m4s)
    */
   getSeederUrl(qualityId: string, segmentId: string): string {
-    return `${this.seederEndpoint}/${this.movieId}/${qualityId}/${segmentId}`;
-  }
-
-  /**
-   * Set seeder endpoint for HTTP fallback
-   */
-  setSeederEndpoint(endpoint: string): void {
-    this.seederEndpoint = endpoint;
-    console.log(`[SignalingClient] Seeder endpoint set to: ${endpoint}`);
+    return this.configManager.getSeederUrl(this.movieId, qualityId, segmentId);
   }
 
   /**
@@ -542,21 +551,6 @@ export class SignalingClient extends EventEmitter<SignalingClientEvents> impleme
     if (this.ws.readyState === WebSocket.CONNECTING) return 'connecting';
     if (this.reconnectTimer) return 'reconnecting';
     return 'disconnected';
-  }
-
-  /**
-   * Get seeder endpoint
-   */
-  getSeederEndpoint(): string {
-    return this.seederEndpoint;
-  }
-
-  /**
-   * Set reconnection strategy (not implemented yet)
-   */
-  setReconnectionStrategy(_strategy: any): void {
-    // TODO: Implement reconnection strategy pattern
-    console.warn('[SignalingClient] setReconnectionStrategy not implemented yet');
   }
 
   /**

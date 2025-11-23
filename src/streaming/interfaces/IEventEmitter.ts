@@ -1,33 +1,10 @@
-/**
- * Event Emitter Interface
- * Base interface for all event-driven components
- */
-
 export interface IEventEmitter<TEvents extends Record<string, (...args: any[]) => void>> {
-  /**
-   * Register an event listener
-   */
   on<K extends keyof TEvents>(event: K, listener: TEvents[K]): void;
-
-  /**
-   * Unregister an event listener
-   */
   off<K extends keyof TEvents>(event: K, listener: TEvents[K]): void;
-
-  /**
-   * Register a one-time event listener
-   */
   once<K extends keyof TEvents>(event: K, listener: TEvents[K]): void;
-
-  /**
-   * Remove all listeners for a specific event or all events
-   */
   removeAllListeners(event?: keyof TEvents): void;
 }
 
-/**
- * Base EventEmitter implementation
- */
 export abstract class EventEmitter<TEvents extends Record<string, (...args: any[]) => void>>
   implements IEventEmitter<TEvents> {
   private listeners = new Map<keyof TEvents, Set<(...args: any[]) => void>>();
@@ -76,12 +53,5 @@ export abstract class EventEmitter<TEvents extends Record<string, (...args: any[
     } else {
       this.listeners.clear();
     }
-  }
-
-  /**
-   * Get listener count for an event
-   */
-  getListenerCount(event: keyof TEvents): number {
-    return this.listeners.get(event)?.size ?? 0;
   }
 }

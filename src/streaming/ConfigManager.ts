@@ -1,12 +1,90 @@
-/**
- * Configuration Manager
- * Centralized configuration for streaming player with default values and validation
- * Refactored to follow SOLID principles
- */
-
 import type { StreamingConfig } from './types';
 import type { IConfigManager } from './interfaces/IConfigManager';
 import { ConfigValidator } from './utils/ConfigValidator';
+
+/**
+ * Application Constants - All magic strings and numbers centralized here
+ */
+export const APP_CONSTANTS = {
+  // File extensions and formats
+  FILE_EXTENSIONS: {
+    MASTER_PLAYLIST: '.m3u8',
+    VARIANT_PLAYLIST: '.m3u8',
+    INIT_SEGMENT: '.mp4',
+    MEDIA_SEGMENT: '.m4s',
+  },
+  
+  // Segment naming patterns
+  SEGMENT_PATTERNS: {
+    PREFIX: 'seg_',
+    REGEX: /seg_(\d+)\.m4s/,
+    PADDING_LENGTH: 4,
+    PADDING_CHAR: '0',
+  },
+  
+  // API paths
+  API_PATHS: {
+    STREAMS_BASE: '/streams/movies',
+    MASTER_PLAYLIST: 'master.m3u8',
+    VARIANT_PLAYLIST: 'playlist.m3u8',
+    INIT_SEGMENT: 'init.mp4',
+  },
+  
+  // Timing constants (in milliseconds)
+  TIMING: {
+    MONITORING_INTERVAL: 1000,
+    CLEANUP_INTERVAL: 10000,
+    CRITICAL_FETCH_DEBOUNCE: 1000,
+    CACHE_CLEANUP_INTERVAL: 5 * 60 * 1000, // 5 minutes
+    SIGNALING_DEBOUNCE: 500,
+    CONNECTION_TIMEOUT: 5000,
+    WHOHAS_CACHE_TTL: 5000,
+    RECONNECT_CLEANUP_DELAY: 100,
+  },
+  
+  // Bandwidth calculation constants
+  BANDWIDTH: {
+    BITS_PER_BYTE: 8,
+    MS_TO_SECONDS: 1000,
+  },
+  
+  // WebRTC configuration
+  WEBRTC: {
+    ICE_SERVERS: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' },
+    ],
+    DATA_CHANNEL: {
+      NAME: 'segments',
+      ORDERED: true,
+      MAX_RETRANSMITS: 3,
+    },
+  },
+  
+  // Cache configuration defaults
+  CACHE_DEFAULTS: {
+    MAX_SIZE: 500 * 1024 * 1024, // 500MB
+    SEGMENT_TTL: 30 * 60 * 1000, // 30 minutes
+    INIT_TTL: 24 * 60 * 60 * 1000, // 24 hours
+    PLAYLIST_TTL: 60 * 60 * 1000, // 1 hour
+    HOT_CACHE_PROTECTION: true,
+  },
+  
+  // WebSocket configuration
+  WEBSOCKET: {
+    PROTOCOL: 'ws',
+    PATH: '/ws/signaling',
+    DEFAULT_PORT: 8080,
+    DEFAULT_HOST: 'localhost',
+    // URL template with placeholders: {protocol}, {host}, {port}, {path}, {clientId}, {movieId}
+    URL_TEMPLATE: '{protocol}://{host}:{port}{path}?clientId={clientId}&movieId={movieId}',
+  },
+  
+  // MIME types
+  MIME_TYPES: {
+    DEFAULT_VIDEO: 'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+  },
+} as const;
 
 export const DEFAULT_CONFIG: StreamingConfig = {
   // Peer settings
@@ -318,24 +396,50 @@ export class ConfigManager implements IConfigManager {
   }
 
   /**
+   * Build signaling server WebSocket URL from template
+   * @param clientId - Client ID
+   * @param movieId - Movie ID
+   * @param customUrl - Optional custom URL template (overrides default)
+   * @returns Formatted WebSocket URL
+   */
+  buildSignalingUrl(
+    clientId: string,
+    movieId: string,
+    customUrl?: string
+  ): string {
+    const { PROTOCOL, DEFAULT_HOST, DEFAULT_PORT, PATH, URL_TEMPLATE } = APP_CONSTANTS.WEBSOCKET;
+    // Use custom template from config if provided, otherwise use parameter or default
+    const template = customUrl || this.config.signalingUrlTemplate || URL_TEMPLATE;
+    
+    return template
+      .replace('{protocol}', PROTOCOL)
+      .replace('{host}', DEFAULT_HOST)
+      .replace('{port}', String(DEFAULT_PORT))
+      .replace('{path}', PATH)
+      .replace('{clientId}', clientId)
+      .replace('{movieId}', movieId);
+  }
+
+  /**
    * Get seeder URL for a specific resource
    */
   getSeederUrl(movieId: string, qualityId: string, resource: 'master' | 'playlist' | 'init' | string): string {
-    const base = this.config.baseUrl + '/streams';
+    const base = this.config.baseUrl;
+    const { STREAMS_BASE, MASTER_PLAYLIST, VARIANT_PLAYLIST, INIT_SEGMENT } = APP_CONSTANTS.API_PATHS;
     
     switch (resource) {
       case 'master':
-        return `${base}/movies/${movieId}/master.m3u8`;
+        return `${base}${STREAMS_BASE}/${movieId}/${MASTER_PLAYLIST}`;
       
       case 'playlist':
-        return `${base}/movies/${movieId}/${qualityId}/playlist.m3u8`;
+        return `${base}${STREAMS_BASE}/${movieId}/${qualityId}/${VARIANT_PLAYLIST}`;
       
       case 'init':
-        return `${base}/movies/${movieId}/${qualityId}/init.mp4`;
+        return `${base}${STREAMS_BASE}/${movieId}/${qualityId}/${INIT_SEGMENT}`;
       
       default:
         // Assume resource is a segment ID with extension (e.g., "seg_0001.m4s")
-        return `${base}/movies/${movieId}/${qualityId}/${resource}`;
+        return `${base}${STREAMS_BASE}/${movieId}/${qualityId}/${resource}`;
     }
   }
 

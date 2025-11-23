@@ -1,19 +1,15 @@
-/**
- * Buffer Manager v2
- * Quản lý buffer playback với prefetch thông minh, sequential append và ABR support
- */
-
 import type {
   SegmentMetadata,
   BufferStatus,
   Quality,
 } from './types';
 import { MseManager } from './MseManager';
-import { ConfigManager } from './ConfigManager';
+import { ConfigManager, APP_CONSTANTS } from './ConfigManager';
 import { EventEmitter } from './interfaces/IEventEmitter';
-import type { IBufferManager, IBufferMonitor, IBufferPrefetcher } from './interfaces/IBufferManager';
+import type { IBufferManager } from './interfaces/IBufferManager';
+import type { CacheManager } from './CacheManager';
 
-export interface BufferManagerEvents {
+export interface BufferManagerEvents extends Record<string, (...args: any[]) => void> {
   bufferLow: (bufferAhead: number) => void;
   bufferCritical: (bufferAhead: number) => void;
   bufferHigh: (bufferAhead: number) => void;
@@ -32,13 +28,11 @@ export interface SegmentAppendRequest {
   timestamp: number; // For ordering
 }
 
-/**
- * Buffer Manager với tích hợp fetch logic và sequential append
- */
 export class BufferManager extends EventEmitter<BufferManagerEvents> implements IBufferManager {
   private mseManager: MseManager;
   private configManager: ConfigManager;
   private videoElement: HTMLVideoElement;
+  private cacheManager: CacheManager | null = null; // Optional cache manager for cleanup
 
   private currentQuality: Quality | null = null;
   private segments: SegmentMetadata[] = [];
@@ -81,6 +75,13 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
   }
 
   /**
+   * Set cache manager for cleanup operations
+   */
+  setCacheManager(cacheManager: CacheManager): void {
+    this.cacheManager = cacheManager;
+  }
+
+  /**
    * Setup video element event listeners
    */
   private setupVideoListeners(): void {
@@ -101,20 +102,14 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
     });
   }
 
-  /**
-   * Initialize buffer manager với quality và segments
-   */
   async initialize(quality: Quality, segments: SegmentMetadata[]): Promise<void> {
     this.currentQuality = quality;
     this.segments = segments;
     this.appendedSegments.clear();
     this.appendQueue = [];
-    this.nextExpectedSegmentIndex = 0; // Start from first segment
+    this.nextExpectedSegmentIndex = 0;
 
-    // Start monitoring
     this.startMonitoring();
-
-    // Initial prefetch to start buffering immediately
     this.prefetchCriticalSegments();
 
     console.log(`[BufferManager] Initialized with quality ${quality.id}, ${segments.length} segments`);
@@ -126,15 +121,15 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
   startMonitoring(): void {
     if (this.monitorInterval) return;
 
-    // Monitoring interval 1000ms
+    const { MONITORING_INTERVAL, CLEANUP_INTERVAL } = APP_CONSTANTS.TIMING;
     this.monitorInterval = window.setInterval(() => {
       this.checkBufferHealth();
 
-      // Cleanup every 10 seconds
-      if (Date.now() % 10000 < 1000) {
+      // Cleanup every interval
+      if (Date.now() % CLEANUP_INTERVAL < MONITORING_INTERVAL) {
         this.performPeriodicCleanup();
       }
-    }, 1000);
+    }, MONITORING_INTERVAL);
   }
 
   /**
@@ -217,7 +212,7 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
 
     // Debounce: Chỉ fetch critical mỗi 1 giây (giảm từ 2s để responsive hơn khi seek)
     const now = Date.now();
-    if (now - this.lastCriticalFetchTime < 1000) {
+    if (now - this.lastCriticalFetchTime < APP_CONSTANTS.TIMING.CRITICAL_FETCH_DEBOUNCE) {
       console.log('[BufferManager] Skipping critical fetch (debounce)');
       return;
     }
@@ -710,19 +705,23 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
   /**
    * Tìm segment tiếp theo sau thời điểm cụ thể
    * Dùng cho quality switch để tìm segment tiếp theo cần fetch
+   * Trả về segment ĐẦU TIÊN có timestamp >= currentTime (chưa bắt đầu phát)
    */
   private findNextSegmentAfterTime(time: number): SegmentMetadata | null {
     if (this.segments.length === 0) return null;
 
     for (let i = 0; i < this.segments.length; i++) {
       const segment = this.segments[i];
-      // Tìm segment đầu tiên có timestamp > currentTime
-      if (segment.timestamp > time) {
+      
+      // Tìm segment đầu tiên BẮT ĐẦU sau currentTime
+      // Segment có timestamp >= time là segment chưa phát hoặc sắp phát
+      if (segment.timestamp >= time) {
         return segment;
       }
     }
 
-    // Nếu không tìm thấy, trả về segment cuối (EOF)
+    // Nếu không tìm thấy (currentTime đã vượt qua tất cả segments)
+    // Trả về segment cuối cùng (EOF case)
     return this.segments[this.segments.length - 1] || null;
   }
 
@@ -801,12 +800,27 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
     if (!this.currentQuality) return;
 
     const oldQualityId = this.currentQuality.id;
+    const oldSegments = this.segments; // Lưu lại segments cũ để xử lý
     console.log(`[BufferManager] Switching quality from ${oldQualityId} to ${newQuality.id}`);
 
     this.emit('qualitySwitch', oldQualityId, newQuality.id);
 
+    // Đợi append queue xong trước khi clear để không mất segments đã fetch
+    if (this.isAppending) {
+      console.log('[BufferManager] Waiting for pending appends before quality switch...');
+      // Đợi tối đa 2s cho append queue
+      const maxWait = 2000;
+      const startWait = Date.now();
+      while (this.isAppending && (Date.now() - startWait) < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+    }
+
     // Clear append queue - xóa các segment đang chờ append
     this.appendQueue = [];
+
+    // Clear fetching segments - xóa tracking segments đang fetch
+    this.fetchingSegments.clear();
 
     // Update quality và segments
     this.currentQuality = newQuality;
@@ -835,23 +849,35 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
     // Giữ lại các segment đã append trước currentTime để tránh gap
     const currentTime = this.videoElement.currentTime;
     const segmentsToRemove: string[] = [];
+    const segmentsToRemoveFromCache: SegmentMetadata[] = [];
 
     for (const segmentKey of this.appendedSegments) {
       const [qualityId] = segmentKey.split(':');
       if (qualityId === oldQualityId) {
-        // Tìm segment trong old quality segments để check time
-        const segment = this.segments.find(s => this.getSegmentKey(s) === segmentKey);
-        // Xóa nếu segment sau currentTime (đã bị remove khỏi buffer)
-        if (!segment || (segment.startTime && segment.startTime >= currentTime)) {
+        // Tìm segment trong OLD segments (không phải this.segments đã update)
+        const segment = oldSegments.find(s => this.getSegmentKey(s) === segmentKey);
+        if (segment) {
+          // Xóa nếu segment sau currentTime (đã bị remove khỏi buffer bởi MSE)
+          if (segment.timestamp >= currentTime) {
+            segmentsToRemove.push(segmentKey);
+            segmentsToRemoveFromCache.push(segment);
+          }
+        } else {
+          // Segment không tìm thấy, xóa khỏi tracking
           segmentsToRemove.push(segmentKey);
         }
       }
     }
 
+    // Xóa khỏi tracking
     for (const key of segmentsToRemove) {
       this.appendedSegments.delete(key);
     }
     console.log(`[BufferManager] Removed ${segmentsToRemove.length} old quality segments from tracking`);
+
+    // Xóa segments cũ khỏi cache để giải phóng bộ nhớ
+    this.removeSegmentsFromCache(segmentsToRemoveFromCache);
+    console.log(`[BufferManager] Removed ${segmentsToRemoveFromCache.length} old segments from cache`);
 
     // Tìm segment tiếp theo tại vị trí currentTime trong quality mới
     const nextSegment = this.findNextSegmentAfterTime(currentTime);
@@ -870,12 +896,13 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
 
   /**
    * Prefetch segments immediately after a quality switch.
-   * Fetches the next segment at the new quality to continue playback seamlessly.
+   * Fetches segments in parallel for faster buffer rebuild.
    */
   private async prefetchSegmentsForQualitySwitch(nextIndex: number): Promise<void> {
     if (!this.fetchSegmentCallback) return;
 
-    const maxAhead = 3; // next segment + 2 more to rebuild buffer quickly
+    const maxAhead = 5; // Tăng lên 5 segments để rebuild buffer nhanh hơn
+    const fetchPromises: Promise<void>[] = [];
 
     for (let offset = 0; offset < maxAhead; offset++) {
       const segment = this.segments[nextIndex + offset];
@@ -883,24 +910,39 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
 
       const segmentKey = this.getSegmentKey(segment);
       if (this.appendedSegments.has(segmentKey)) continue;
+      
+      // Mark as fetching để tránh duplicate
+      if (this.fetchingSegments.has(segmentKey)) continue;
+      this.fetchingSegments.add(segmentKey);
 
       const isCritical = offset === 0; // First segment is critical
-      const priority = isCritical ? 120 : 90 - offset * 10;
+      const priority = isCritical ? 150 : 100 - offset * 10; // Tăng priority để append nhanh hơn
 
       this.emit('segmentNeeded', segment, isCritical);
 
-      try {
-        const data = await this.fetchSegmentCallback(segment, isCritical);
-        if (data) {
-          this.queueSegmentForAppend(segment, data, priority, isCritical);
-        }
-      } catch (error) {
-        console.warn(
-          `[BufferManager] Failed to prefetch segment ${segment.id} during quality switch:`,
-          error
-        );
-      }
+      // Fetch song song (parallel) thay vì tuần tự
+      const fetchPromise = this.fetchSegmentCallback(segment, isCritical)
+        .then(data => {
+          if (data) {
+            this.queueSegmentForAppend(segment, data, priority, false);
+          }
+        })
+        .catch(error => {
+          console.warn(
+            `[BufferManager] Failed to prefetch segment ${segment.id} during quality switch:`,
+            error
+          );
+        })
+        .finally(() => {
+          this.fetchingSegments.delete(segmentKey);
+        });
+      
+      fetchPromises.push(fetchPromise);
     }
+
+    // Đợi tất cả segments fetch xong (parallel)
+    await Promise.all(fetchPromises);
+    console.log(`[BufferManager] Quality switch prefetch completed: ${fetchPromises.length} segments`);
   }
 
   /**
@@ -908,6 +950,23 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
    */
   private getSegmentKey(segment: SegmentMetadata): string {
     return `${segment.qualityId}:${segment.id}`;
+  }
+
+  /**
+   * Remove segments from cache manager
+   * Helper method để xóa segments khỏi cache khi không còn cần thiết
+   */
+  private removeSegmentsFromCache(segments: SegmentMetadata[]): void {
+    if (!this.cacheManager || segments.length === 0) return;
+
+    for (const segment of segments) {
+      try {
+        const key = `segment:${segment.movieId}:${segment.qualityId}:${segment.id}`;
+        this.cacheManager.delete(key);
+      } catch (error) {
+        console.warn(`[BufferManager] Failed to remove segment ${segment.id} from cache:`, error);
+      }
+    }
   }
 
   /**
@@ -921,6 +980,7 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
     const cleanupAheadTime = currentTime + (config.prefetchWindowAhead + 120);
 
     const segmentsToRemove: string[] = [];
+    const segmentsToRemoveFromCache: SegmentMetadata[] = [];
 
     // Check all appended segments
     for (const segmentKey of this.appendedSegments) {
@@ -935,6 +995,7 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
       // Remove if outside cleanup window
       if (segment.timestamp < cleanupBehindTime || segment.timestamp > cleanupAheadTime) {
         segmentsToRemove.push(segmentKey);
+        segmentsToRemoveFromCache.push(segment);
       }
     }
 
@@ -944,6 +1005,10 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
         this.appendedSegments.delete(key);
       }
       console.log(`[BufferManager] Cleaned up ${segmentsToRemove.length} old segment references (current: ${this.appendedSegments.size})`);
+      
+      // Xóa segments khỏi cache
+      this.removeSegmentsFromCache(segmentsToRemoveFromCache);
+      console.log(`[BufferManager] Removed ${segmentsToRemoveFromCache.length} old segments from cache`);
     }
   }
 
@@ -964,8 +1029,35 @@ export class BufferManager extends EventEmitter<BufferManagerEvents> implements 
   /**
    * Prefetch segments (IBufferPrefetcher interface)
    */
-  prefetch(count: number): void {
-    this.prefetchSegments(count);
+  prefetch(): void {
+    this.prefetchSegments();
+  }
+
+  /**
+   * Update quality (implement IBufferManager interface)
+   */
+  async updateQuality(quality: Quality, segments: SegmentMetadata[]): Promise<void> {
+    // This requires init segment data which is not provided in the interface
+    // For now, just update the quality and segments without switching init
+    this.currentQuality = quality;
+    this.segments = segments;
+    console.log(`[BufferManager] Updated quality to ${quality.id} with ${segments.length} segments`);
+  }
+
+  /**
+   * Handle seek (implement IBufferManager interface)
+   */
+  async handleSeek(targetTime: number): Promise<void> {
+    await this.handleSeeking();
+    await this.prefetchSegmentsAroundSeek(targetTime);
+  }
+
+  /**
+   * Set prefetch strategy (implement IBufferManager interface)
+   */
+  setPrefetchStrategy(strategy: any): void {
+    // Placeholder for future implementation
+    console.log('[BufferManager] Prefetch strategy set:', strategy?.name);
   }
 
   /**

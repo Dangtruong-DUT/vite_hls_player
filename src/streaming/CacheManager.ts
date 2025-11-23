@@ -1,16 +1,3 @@
-/**
- * Cache Manager v2 - Client-Side
- * Refactored to follow SOLID principles
- * 
- * Features:
- * - Lưu segment, init segment, playlist theo key (streamId, qualityId, segmentId)
- * - Init + playlist luôn ưu tiên giữ (hot cache - never evict)
- * - Media segment theo LRU + TTL (auto evict)
- * - Lookup nhanh cho fetch/append
- * - Map time → segmentId cho seek support
- * - Biết endpoint fallback Seeder
- */
-
 import type { 
   CacheStats, 
   InitSegment, 
@@ -20,15 +7,9 @@ import type {
 } from './types';
 import type { ICacheManager, ICacheEvictionStrategy, ICacheEntry } from './interfaces/ICacheManager';
 import { LRUEvictionStrategy } from './strategies/CacheEvictionStrategies';
+import { APP_CONSTANTS, type ConfigManager } from './ConfigManager';
 
 export type CacheableData = ArrayBuffer | InitSegment | MasterPlaylist | VariantPlaylist;
-
-export interface SeederEndpoints {
-  masterPlaylist: (movieId: string) => string;
-  variantPlaylist: (movieId: string, qualityId: string) => string;
-  initSegment: (movieId: string, qualityId: string) => string;
-  mediaSegment: (movieId: string, qualityId: string, segmentId: string) => string;
-}
 
 export interface CacheConfig {
   maxSize: number; // Total cache size in bytes
@@ -53,6 +34,7 @@ export class CacheManager implements ICacheManager {
   
   // Configuration
   private config: CacheConfig;
+  private configManager: ConfigManager;
   private currentSize = 0;
   
   // Eviction strategy (Strategy Pattern)
@@ -68,30 +50,33 @@ export class CacheManager implements ICacheManager {
     itemCount: 0,
   };
 
-  // Seeder endpoints
-  private seederEndpoints: SeederEndpoints = {
-    masterPlaylist: (movieId) => `/api/v1/streams/movies/${movieId}/master.m3u8`,
-    variantPlaylist: (movieId, qualityId) => `/api/v1/streams/movies/${movieId}/${qualityId}/playlist.m3u8`,
-    initSegment: (movieId, qualityId) => `/api/v1/streams/movies/${movieId}/${qualityId}/init.mp4`,
-    mediaSegment: (movieId, qualityId, segmentId) => `/api/v1/streams/movies/${movieId}/${qualityId}/${segmentId}`,
-  };
+  // Callback for segment eviction/deletion - notify signaling server
+  private onSegmentRemoved?: (movieId: string, qualityId: string, segmentId: string) => void;
 
-  constructor(config?: Partial<CacheConfig & { evictionStrategy?: ICacheEvictionStrategy }>) {
+  constructor(
+    configManager: ConfigManager,
+    config?: Partial<CacheConfig & { 
+      evictionStrategy?: ICacheEvictionStrategy;
+      onSegmentRemoved?: (movieId: string, qualityId: string, segmentId: string) => void;
+    }>
+  ) {
+    this.configManager = configManager;
     this.config = {
-      maxSize: config?.maxSize || 500 * 1024 * 1024, // 500MB default
-      segmentTTL: config?.segmentTTL || 30 * 60 * 1000, // 30 minutes
-      initTTL: config?.initTTL || 24 * 60 * 60 * 1000, // 24 hours
-      playlistTTL: config?.playlistTTL || 60 * 60 * 1000, // 1 hour
-      hotCacheProtection: config?.hotCacheProtection ?? true,
+      maxSize: config?.maxSize || APP_CONSTANTS.CACHE_DEFAULTS.MAX_SIZE,
+      segmentTTL: config?.segmentTTL || APP_CONSTANTS.CACHE_DEFAULTS.SEGMENT_TTL,
+      initTTL: config?.initTTL || APP_CONSTANTS.CACHE_DEFAULTS.INIT_TTL,
+      playlistTTL: config?.playlistTTL || APP_CONSTANTS.CACHE_DEFAULTS.PLAYLIST_TTL,
+      hotCacheProtection: config?.hotCacheProtection ?? APP_CONSTANTS.CACHE_DEFAULTS.HOT_CACHE_PROTECTION,
     };
 
     // Default to LRU eviction strategy
     this.evictionStrategy = config?.evictionStrategy || new LRUEvictionStrategy();
+    this.onSegmentRemoved = config?.onSegmentRemoved;
 
     this.stats.maxSize = this.config.maxSize;
 
-    // Auto cleanup expired entries every 5 minutes
-    setInterval(() => this.cleanExpired(), 5 * 60 * 1000);
+    // Auto cleanup expired entries
+    setInterval(() => this.cleanExpired(), APP_CONSTANTS.TIMING.CACHE_CLEANUP_INTERVAL);
   }
 
   /**
@@ -107,35 +92,29 @@ export class CacheManager implements ICacheManager {
   getTimeMapper() {
     return {
       buildTimeMap: this.buildSegmentTimeMap.bind(this),
-      findSegmentAtTime: this.findSegmentAtTime.bind(this),
-      getSegmentsInRange: this.getSegmentsInTimeRange.bind(this),
+      findSegmentAtTime: this.findSegmentIdAtTime.bind(this),
+      getSegmentsInRange: this.getSegmentIdsInTimeRange.bind(this),
       clearTimeMap: this.clearSegmentTimeMap.bind(this),
     };
   }
 
   // ============ Core Cache Operations ============
 
-  /**
-   * Store data in cache with TTL
-   */
   set(key: string, data: CacheableData, ttl: number, isHot = false): void {
     const size = this.calculateSize(data);
 
-    // Check if we need to evict (skip if hot cache item)
     if (!isHot) {
       while (this.currentSize + size > this.config.maxSize && this.cache.size > 0) {
         this.evict();
       }
     }
 
-    // If item exists, remove old size
     const existing = this.cache.get(key);
     if (existing) {
       this.currentSize -= existing.size;
       this.removeFromAccessOrder(key);
     }
 
-    // Create cache entry
     const entry: ICacheEntry<CacheableData> = {
       key,
       data,
@@ -146,7 +125,6 @@ export class CacheManager implements ICacheManager {
       lastAccessed: Date.now(),
     };
 
-    // Add to cache
     this.cache.set(key, entry);
     
     // Mark as hot cache if needed (protected from eviction)
@@ -217,6 +195,9 @@ export class CacheManager implements ICacheManager {
     const entry = this.cache.get(key);
     if (!entry) return false;
 
+    // Check if this is a media segment and notify if needed
+    this.notifySegmentRemoval(key);
+
     this.cache.delete(key);
     this.hotCache.delete(key);
     this.currentSize -= entry.size;
@@ -226,9 +207,6 @@ export class CacheManager implements ICacheManager {
     return true;
   }
 
-  /**
-   * Clear all cache
-   */
   clear(): void {
     this.cache.clear();
     this.hotCache.clear();
@@ -357,6 +335,76 @@ export class CacheManager implements ICacheManager {
   // ============ Time → SegmentId Mapping (cho seek support) ============
 
   /**
+   * Build segment time map (ISegmentTimeMapper interface)
+   */
+  buildSegmentTimeMap(
+    movieId: string,
+    qualityId: string,
+    segments: Array<{ id: string; timestamp: number; duration: number }>
+  ): void {
+    const mapKey = `${movieId}:${qualityId}`;
+    const metadata: SegmentMetadata[] = segments.map(s => ({
+      id: s.id,
+      movieId,
+      qualityId,
+      timestamp: s.timestamp,
+      duration: s.duration,
+    }));
+    this.segmentTimeMaps.set(mapKey, metadata);
+    console.log(`[CacheManager] Built time map for ${mapKey} (${segments.length} segments)`);
+  }
+
+  /**
+   * Find segment ID at time (ISegmentTimeMapper interface)
+   */
+  findSegmentIdAtTime(movieId: string, qualityId: string, time: number): string | null {
+    return this.mapTimeToSegmentId(movieId, qualityId, time);
+  }
+
+  /**
+   * Get segment IDs in time range (ISegmentTimeMapper interface)
+   */
+  getSegmentIdsInTimeRange(
+    movieId: string,
+    qualityId: string,
+    startTime: number,
+    endTime: number
+  ): string[] {
+    const mapKey = `${movieId}:${qualityId}`;
+    const segments = this.segmentTimeMaps.get(mapKey);
+    
+    if (!segments) return [];
+    
+    return segments
+      .filter(s => {
+        const segEnd = s.timestamp + s.duration;
+        return s.timestamp < endTime && segEnd > startTime;
+      })
+      .map(s => s.id);
+  }
+
+  /**
+   * Clear time map (ISegmentTimeMapper interface)
+   */
+  clearSegmentTimeMap(movieId: string, qualityId?: string): void {
+    if (qualityId) {
+      const mapKey = `${movieId}:${qualityId}`;
+      this.segmentTimeMaps.delete(mapKey);
+      console.log(`[CacheManager] Cleared time map for ${mapKey}`);
+    } else {
+      // Clear all maps for this movieId
+      const keysToDelete: string[] = [];
+      this.segmentTimeMaps.forEach((_, key) => {
+        if (key.startsWith(`${movieId}:`)) {
+          keysToDelete.push(key);
+        }
+      });
+      keysToDelete.forEach(key => this.segmentTimeMaps.delete(key));
+      console.log(`[CacheManager] Cleared ${keysToDelete.length} time maps for movie ${movieId}`);
+    }
+  }
+
+  /**
    * Store segment time mapping (from playlist)
    */
   private storeSegmentTimeMap(
@@ -447,36 +495,6 @@ export class CacheManager implements ICacheManager {
     return segments.slice(startIndex, endIndex + 1);
   }
 
-  // ============ Seeder Fallback Endpoints ============
-
-  /**
-   * Get Seeder endpoint cho master playlist
-   */
-  getMasterPlaylistEndpoint(movieId: string): string {
-    return this.seederEndpoints.masterPlaylist(movieId);
-  }
-
-  /**
-   * Get Seeder endpoint cho variant playlist
-   */
-  getVariantPlaylistEndpoint(movieId: string, qualityId: string): string {
-    return this.seederEndpoints.variantPlaylist(movieId, qualityId);
-  }
-
-  /**
-   * Get Seeder endpoint cho init segment
-   */
-  getInitSegmentEndpoint(movieId: string, qualityId: string): string {
-    return this.seederEndpoints.initSegment(movieId, qualityId);
-  }
-
-  /**
-   * Get Seeder endpoint cho media segment
-   */
-  getMediaSegmentEndpoint(movieId: string, qualityId: string, segmentId: string): string {
-    return this.seederEndpoints.mediaSegment(movieId, qualityId, segmentId);
-  }
-
   /**
    * Fetch từ Seeder với fallback
    */
@@ -493,90 +511,35 @@ export class CacheManager implements ICacheManager {
     }
   }
 
-  /**
-   * Fetch và cache segment từ Seeder
-   */
-  async fetchAndCacheSegment(
-    movieId: string,
-    qualityId: string,
-    segmentId: string
-  ): Promise<ArrayBuffer> {
-    // Check cache first
-    const cached = this.getSegment(movieId, qualityId, segmentId);
-    if (cached) {
-      console.log(`[CacheManager] Cache hit: segment ${segmentId}`);
-      return cached;
-    }
-
-    // Fetch from Seeder
-    const endpoint = this.getMediaSegmentEndpoint(movieId, qualityId, segmentId);
-    console.log(`[CacheManager] Fetching from Seeder: ${endpoint}`);
-    
-    const data = await this.fetchFromSeeder(endpoint);
-    
-    // Cache it
-    this.setSegment(movieId, qualityId, segmentId, data);
-    
-    return data;
-  }
-
-  /**
-   * Fetch và cache init segment từ Seeder
-   */
-  async fetchAndCacheInitSegment(movieId: string, qualityId: string): Promise<InitSegment> {
-    // Check cache first
-    const cached = this.getInitSegment(movieId, qualityId);
-    if (cached) {
-      console.log(`[CacheManager] Cache hit: init segment ${qualityId}`);
-      return cached;
-    }
-
-    // Fetch from Seeder
-    const endpoint = this.getInitSegmentEndpoint(movieId, qualityId);
-    console.log(`[CacheManager] Fetching init from Seeder: ${endpoint}`);
-    
-    const data = await this.fetchFromSeeder(endpoint);
-    
-    const initSegment: InitSegment = {
-      qualityId,
-      data,
-      url: endpoint,
-    };
-    
-    // Cache it (HOT)
-    this.setInitSegment(movieId, qualityId, initSegment);
-    
-    return initSegment;
-  }
-
   // ============ LRU Eviction (skip hot cache) ============
 
   /**
-   * Evict LRU item (skip hot cache items)
+   * Evict item using eviction strategy
    */
-  private evictLRU(): void {
-    if (this.accessOrder.length === 0) return;
+  private evict(): void {
+    const keyToEvict = this.evictionStrategy.selectEvictionCandidate(
+      this.cache,
+      this.hotCache,
+      0
+    );
 
-    // Find first non-hot cache item to evict
-    for (let i = 0; i < this.accessOrder.length; i++) {
-      const keyToEvict = this.accessOrder[i];
-      
-      if (!this.hotCache.has(keyToEvict)) {
-        // Evict this item
-        const entry = this.cache.get(keyToEvict);
-        if (entry) {
-          this.cache.delete(keyToEvict);
-          this.currentSize -= entry.size;
-          this.accessOrder.splice(i, 1);
-          this.stats.evictions++;
-          
-          console.log(`[CacheManager] Evicted ${keyToEvict} (${this.formatSize(entry.size)})`);
-        }
-        return;
-      }
+    if (!keyToEvict) {
+      console.warn('[CacheManager] No eviction candidate found');
+      return;
     }
 
-    console.warn('[CacheManager] All items are hot cache - cannot evict');
+    const entry = this.cache.get(keyToEvict);
+    if (entry) {
+      // Notify before removing the segment
+      this.notifySegmentRemoval(keyToEvict);
+
+      this.cache.delete(keyToEvict);
+      this.currentSize -= entry.size;
+      this.removeFromAccessOrder(keyToEvict);
+      this.stats.evictions++;
+      
+      console.log(`[CacheManager] Evicted ${keyToEvict} (${this.formatSize(entry.size)})`);
+    }
   }
 
   /**
@@ -586,6 +549,28 @@ export class CacheManager implements ICacheManager {
     const index = this.accessOrder.indexOf(key);
     if (index > -1) {
       this.accessOrder.splice(index, 1);
+    }
+  }
+
+  /**
+   * Notify signaling server when a media segment is removed from cache
+   * This ensures the signaling server has accurate info about available segments
+   */
+  private notifySegmentRemoval(key: string): void {
+    // Only notify for media segments (format: "segment:movieId:qualityId:segmentId")
+    if (!key.startsWith('segment:') || !this.onSegmentRemoved) {
+      return;
+    }
+
+    try {
+      const parts = key.split(':');
+      if (parts.length === 4) {
+        const [, movieId, qualityId, segmentId] = parts;
+        this.onSegmentRemoved(movieId, qualityId, segmentId);
+        console.log(`[CacheManager] Notified removal of segment: ${movieId}/${qualityId}/${segmentId}`);
+      }
+    } catch (error) {
+      console.warn('[CacheManager] Failed to notify segment removal:', error);
     }
   }
 
@@ -632,6 +617,7 @@ export class CacheManager implements ICacheManager {
       }
     });
 
+    // Delete will handle notification for each segment
     keysToDelete.forEach(key => this.delete(key));
     
     if (keysToDelete.length > 0) {
@@ -671,10 +657,27 @@ export class CacheManager implements ICacheManager {
   // ============ Statistics & Debug ============
 
   /**
+   * Get current cache size
+   */
+  getCurrentSize(): number {
+    return this.currentSize;
+  }
+
+  /**
+   * Get item count
+   */
+  getItemCount(): number {
+    return this.cache.size;
+  }
+
+  /**
    * Get cache statistics
    */
-  getStats(): CacheStats {
-    return { ...this.stats };
+  getStats(): CacheStats & { hitRate: number } {
+    return { 
+      ...this.stats,
+      hitRate: this.getHitRate()
+    };
   }
 
   /**
@@ -756,17 +759,7 @@ export class CacheManager implements ICacheManager {
 
     // Evict if necessary
     while (this.currentSize > this.config.maxSize && this.cache.size > 0) {
-      this.evictLRU();
+      this.evict();
     }
-  }
-
-  /**
-   * Custom Seeder endpoints
-   */
-  setSeederEndpoints(endpoints: Partial<SeederEndpoints>): void {
-    this.seederEndpoints = {
-      ...this.seederEndpoints,
-      ...endpoints,
-    };
   }
 }
