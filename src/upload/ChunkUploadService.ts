@@ -19,18 +19,17 @@ export interface UploadStatus {
     missingChunks: number[];
 }
 
-export interface MovieStatus {
+export interface MovieProcessStatus {
     movieId: string;
-    status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
-    qualities?: Record<string, string>;
+    processStatus: 'UPLOADING' | 'PROCESSING' | 'COMPLETED' | 'FAILED';
 }
 
 export interface MovieInfo {
     movieId: string;
     title: string;
     description: string;
-    status: 'PENDING' | 'PROCESSING' | 'READY' | 'FAILED';
-    qualities?: Record<string, string>;
+    status: string;
+    qualities?: string[];
 }
 
 export class ChunkUploadService {
@@ -40,7 +39,7 @@ export class ChunkUploadService {
     private totalChunks: number = 0;
     private uploadedChunks: Set<number> = new Set();
     private options: ChunkUploadOptions;
-    
+
     // Configuration
     private readonly CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
     private readonly MAX_CONCURRENT_CHUNKS = 3;
@@ -131,8 +130,8 @@ export class ChunkUploadService {
         return response.data.data;
     }
 
-    async checkMovieStatus(movieId: string): Promise<MovieStatus> {
-        const response = await this.api.get(`/api/v1/movies/${movieId}/status`);
+    async checkMovieStatus(movieId: string): Promise<MovieProcessStatus> {
+        const response = await this.api.get(`/api/v1/movies/${movieId}/process-status`);
         return response.data.data;
     }
 
@@ -158,22 +157,22 @@ export class ChunkUploadService {
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
                 const statusData = await this.checkMovieStatus(movieId);
-                const status = statusData.status;
+                const status = statusData.processStatus;
 
                 console.log(`[${attempt}/${maxAttempts}] Current status: ${status}`);
-                
+
                 if (options.onStatusChange) {
                     options.onStatusChange(status, attempt);
                 }
 
-                if (status === 'READY') {
+                if (status === 'COMPLETED') {
                     console.log('🎉 Movie is ready!');
                     const movieInfo = await this.getMovieInfo(movieId);
-                    
+
                     if (movieInfo.qualities) {
-                        console.log('Available qualities:', Object.keys(movieInfo.qualities));
+                        console.log('Available qualities:', movieInfo.qualities);
                     }
-                    
+
                     return movieInfo;
                 } else if (status === 'FAILED') {
                     console.error('❌ Movie processing failed');
@@ -222,14 +221,14 @@ export class ChunkUploadService {
 
         // Calculate checksum
         const arrayBuffer = await chunkBlob.arrayBuffer();
-        const wordArray = CryptoJS.lib.WordArray.create(arrayBuffer as any);
+        const wordArray = CryptoJS.lib.WordArray.create(new Uint8Array(arrayBuffer));
         const checksum = CryptoJS.MD5(wordArray).toString();
 
         const formData = new FormData();
-        
+
         // Append binary chunk data
         formData.append('chunk', chunkBlob, `chunk_${chunkNumber}`);
-        
+
         // Append metadata as JSON with explicit content type
         const metadata = {
             uploadId: this.uploadId,
@@ -237,8 +236,8 @@ export class ChunkUploadService {
             chunkSize,
             checksum
         };
-        const metadataBlob = new Blob([JSON.stringify(metadata)], { 
-            type: 'application/json' 
+        const metadataBlob = new Blob([JSON.stringify(metadata)], {
+            type: 'application/json'
         });
         formData.append('data', metadataBlob);
 
@@ -250,7 +249,7 @@ export class ChunkUploadService {
 
         this.uploadedChunks.add(chunkNumber);
         const progress = Math.round((this.uploadedChunks.size / this.totalChunks) * 100);
-        
+
         if (this.options.onChunkUploaded) {
             this.options.onChunkUploaded(chunkNumber, progress);
         }
